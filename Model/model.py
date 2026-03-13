@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F 
+from .device import device
 
 class ResBlock(nn.Module):
     def __init__(self, channels):
@@ -10,6 +11,8 @@ class ResBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(channels)
         self.bn2 = nn.BatchNorm2d(channels)
         self.res = nn.Identity()
+        
+        self.to(device)
 
     def forward(self, x):
         residual = self.res(x)

@@ -1,6 +1,7 @@
 import bulletchess as chess
 import torch
 import numpy as np
+from .device import device
 
 SHIFTS = torch.arange(64, dtype=torch.int64)
 PIECES = [chess.Piece(chess.WHITE, x) for x in chess.PIECE_TYPES] + [chess.Piece(chess.BLACK, x) for x in chess.PIECE_TYPES] 
