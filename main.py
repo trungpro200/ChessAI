@@ -2,17 +2,16 @@ import bulletchess as chess
 import Model
 import torch
 import timeit 
+from Model.device import device
 
-board = chess.Board()
+board = chess.Board.from_fen('rnbqkbnr/1pppp1pp/p7/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3')
+model = Model.ChessModel(token_dim=103)
 
-bit = board[chess.Piece(chess.WHITE, chess.PAWN)]
-
-#0.3784495000145398s
+# 1.601748300017789s
 # print(Model.encode_board(board))
 
-model = Model.ChessModel()
+e = Model.encode_board_init(board).to(device).unsqueeze(0)
+res = model(e)
 
-test = torch.ones(1,64,101, device='cuda')
-v = model(test)
-
-print(v)
+print(res)
+print(res[0].shape)
