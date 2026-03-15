@@ -3,9 +3,6 @@ import torch
 import numpy as np
 from .device import device
 
-SHIFTS = torch.arange(64, dtype=torch.int64)
-PIECES = [chess.Piece(chess.WHITE, x) for x in chess.PIECE_TYPES] + [chess.Piece(chess.BLACK, x) for x in chess.PIECE_TYPES] 
-
 PLANES = 73
 
 DIRECTIONS = [
@@ -17,9 +14,6 @@ KNIGHT_DIRS = [
     (1,2),(2,1),(2,-1),(1,-2),
     (-1,-2),(-2,-1),(-2,1),(-1,2)
 ]
-
-def to_signed_64(x):
-    return (x + (1 << 63)) % (1 << 64) - (1 << 63)
 
 def square_to_xy(sq):
     return sq % 8, sq // 8
@@ -82,7 +76,7 @@ for from_sq in range(64):
                 MOVE_TABLE[from_sq][plane] = (to_sq, promo)
         plane = 64 + direction*3 + 3
 
-ENCODE_TABLE = {}
+ENCODE_TABLE: dict[tuple[int, int, chess.PieceType | None], tuple[int, int]] = {}
 
 def build_encode_table():
     for from_sq in range(64):
@@ -97,16 +91,15 @@ def build_encode_table():
 
             key = (from_sq, to_sq, promo)
 
-            action = from_sq*73 + plane
+            action = from_sq, plane
 
             ENCODE_TABLE[key] = action
 
 build_encode_table()
 
-def decode_move_fast(board: chess.Board, action: int):
+def decode_move_fast(board: chess.Board, action: tuple[int, int] ):
 
-    from_sq = action // 73
-    plane = action % 73
+    from_sq, plane = action
 
     entry = MOVE_TABLE[from_sq][plane]
 
@@ -129,17 +122,6 @@ def encode_move_fast(move: chess.Move | None):
     key = (move.origin.index(), move.destination.index(), None if move.promotion is chess.QUEEN else move.promotion) # type: ignore
 
     return ENCODE_TABLE[key]
-
-def bitboards_to_tensor(bitboards):
-    bb = torch.tensor(bitboards, dtype=torch.int64).unsqueeze(1)
-
-    bits = ((bb >> SHIFTS) & 1).bool()
-
-    return bits.view(-1, 8, 8)
-
-def encode_board(board: chess.Board):
-    planes = bitboards_to_tensor([to_signed_64(int(board[x])) for x in PIECES])
-    return planes
 
 def test_roundtrip(board, uci):
 
@@ -196,5 +178,4 @@ def roundtrip_cases():
 if __name__ == "__main__":
     board = chess.Board()
     
-    for move in board.legal_moves():
-        test_roundtrip(board, move.uci())
+    roundtrip_cases()

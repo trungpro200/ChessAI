@@ -27,9 +27,6 @@ class ShawRelativeAttention(nn.Module):
         self.head_dim = d_model // n_heads
         self.max_dist = max_dist
         
-        # Nhúng đầu vào
-        self.input_embedding = ChessInputEmbedding(d_model=d_model)
-        
         # Ma trận chiếu cho nội dung (Standard QKV)
         self.w_q = nn.Linear(d_model, d_model, bias=False)
         self.w_k = nn.Linear(d_model, d_model, bias=False)
@@ -37,6 +34,8 @@ class ShawRelativeAttention(nn.Module):
         
         # Bảng nhúng vị trí tương đối (Shaw et al. 2018)
         num_rel_pos = 2 * max_dist + 1
+        
+        self.rel_embed_q = nn.Embedding(num_rel_pos, self.head_dim)
         self.rel_embed_k = nn.Embedding(num_rel_pos, self.head_dim)
         self.rel_embed_v = nn.Embedding(num_rel_pos, self.head_dim)
         
@@ -57,43 +56,44 @@ class ShawRelativeAttention(nn.Module):
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
         
-        x = self.input_embedding(x)
-        
         # 1. Chiếu nội dung và tách đầu (Heads)
         q = self.w_q(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.w_k(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.w_v(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
         # 2. Lấy vector nhúng từ nn.Embedding
-        # rel_indices shape: 
-        
-        # a_k, a_v shape: (64, 64, 32)
+        # rel_indices shape: (64, 64)
+        # a_k, a_v, a_q shape: (64, 64, 32)
+
+        a_q = self.rel_embed_q(self.rel_indices)
         a_k = self.rel_embed_k(self.rel_indices) 
         a_v = self.rel_embed_v(self.rel_indices)
-        
 
-        # 3. Tính Attention Scores (Logits)
-        # Tích nội dung: (batch, heads, seq, seq)
-        content_logits = torch.matmul(q, k.transpose(-1, -2))
+         # 3. Tính toán Attention Logits (Mở rộng đầy đủ)
+        # Tích nội dung: q * k^T
+        content_logits = torch.matmul(q, k.transpose(-1, -2)) # [B, H, 64, 64]
         
-        # Tích Shaw (Relative Key): q * a_k^T
-        # bhld: batch, head, len, dim | lmd: len, len, dim -> bhlm: batch, head, len, len
-        print(q.shape, a_k.shape)
-        rel_logits = torch.einsum('bhld,lmd->bhlm', q, a_k)
+        # Tương tác Query-Position: q * a_k^T
+        rel_logits_k = torch.einsum('bhld,lmd->bhlm', q, a_k)
         
-        # Tổng hợp và Softmax
-        logits = (content_logits + rel_logits) / (self.head_dim ** 0.5)
-        attn = F.softmax(logits, dim=-1)
+        # Tương tác Position-Key: a_q * k^T
+        rel_logits_q = torch.einsum('bhmd,lmd->bhlm', k, a_q)
+        
+        # Tương tác Position-Position: a_q * a_k^T
+        rel_pos_pos = torch.einsum('lmd,lmd->lm', a_q, a_k) 
+        
+        # Tổng hợp Logits:
+        logits = (content_logits + rel_logits_k + rel_logits_q + rel_pos_pos) / (self.head_dim ** 0.5) 
+        attn = F.softmax(logits, dim=-1) # alpha
 
-        # 4. Tính Output
-        # Tổng nội dung: (batch, heads, seq, head_dim) 
+        # 4. Tính toán Output
+        # Tổng nội dung: attn * v
         content_out = torch.matmul(attn, v)
-        # Tổng Shaw (Relative Value): attn * a_v
+        # Tổng vị trí tương đối: attn * a_v
         rel_out = torch.einsum('bhlm,lmd->bhld', attn, a_v)
         
         out = content_out + rel_out
         
-        # Gom các đầu lại và trả về d_model (256) 
         return out.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
     
 class ChessTransformerBlock(nn.Module):

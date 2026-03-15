@@ -10,10 +10,9 @@ bit = board[chess.Piece(chess.WHITE, chess.PAWN)]
 #0.3784495000145398s
 # print(Model.encode_board(board))
 
-model = Model.ShawRelativeAttention()
+model = Model.ChessModel()
 
-test = torch.ones(1,64,112, device='cuda')
+test = torch.ones(1,64,101, device='cuda')
 v = model(test)
 
-
-board.__hash__()
+print(v)
