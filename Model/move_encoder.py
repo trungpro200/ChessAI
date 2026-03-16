@@ -97,7 +97,7 @@ def build_encode_table():
 
 build_encode_table()
 
-def decode_move_fast(board: chess.Board, action: tuple[int, int] ):
+def decode_move(board: chess.Board, action: tuple[int, int] ):
 
     from_sq, plane = action
 
@@ -118,7 +118,7 @@ def decode_move_fast(board: chess.Board, action: tuple[int, int] ):
     
     return chess.Move(chess.SQUARES[from_sq], chess.SQUARES[to_sq], promo) # type: ignore
 
-def encode_move_fast(move: chess.Move | None):
+def encode_move(move: chess.Move | None):
     key = (move.origin.index(), move.destination.index(), None if move.promotion is chess.QUEEN else move.promotion) # type: ignore
 
     return ENCODE_TABLE[key]
@@ -127,9 +127,9 @@ def test_roundtrip(board, uci):
 
     move = chess.Move.from_uci(uci)
 
-    action = encode_move_fast(move)
+    action = encode_move(move)
 
-    decoded = decode_move_fast(board, action)
+    decoded = decode_move(board, action)
 
     print("move:", move)
     print("action:", action)

@@ -1,5 +1,6 @@
 import torch
 import bulletchess as chess
+from .move_encoder import encode_move, decode_move
 
 SHIFTS = torch.arange(64, dtype=torch.int64)
 PIECES = [chess.Piece(chess.WHITE, x) for x in chess.PIECE_TYPES] + [chess.Piece(chess.BLACK, x) for x in chess.PIECE_TYPES] 
@@ -42,6 +43,17 @@ def build_metadata(board: chess.Board) -> torch.Tensor:
     return meta
 
 def encode_board_init(board: chess.Board): # -> [64, 103]
+    """## Tokenization
+    
+    Encode board into 64 tokens [64,103]
+    
+    ### Planes:
+        0-95: positions
+        96: turn
+        97-100: castling rights
+        101: en-passant
+        102: repetition
+    """
     current_board = bitboards_to_tensor([to_signed_64(int(board[x])) for x in PIECES])
     history = torch.zeros(64,84)
     
@@ -50,5 +62,29 @@ def encode_board_init(board: chess.Board): # -> [64, 103]
     
     return torch.concat([current_board, history, meta], 1)
 
-def encode_board_propagate(tokens: torch.Tensor, action: tuple[int, int]):
-    pass
+def encode_board_propagate(tokens: torch.Tensor, board: chess.Board, action: tuple[int, int]):
+    move = decode_move(board, action)
+    
+    # assert move in board.legal_moves(), "Illegal Move"
+    
+    # Shift history down
+    for i in range(7):
+        start_l = 84 - (i*12)
+        end_l = start_l + 12
+        
+        start_h, end_h = start_l - 12, end_l - 12
+        
+        tokens[: ,start_l:end_l] = tokens[:, start_h:end_h]
+    
+    # Flip the turn plane
+    if board.turn == chess.WHITE: # Flip to black
+        tokens[:, 96] = 0
+    else:
+        tokens[:, 96] = 1
+    
+    #Reset enpassant plane
+    tokens[:,101] = 0
+    
+    
+    
+    return tokens

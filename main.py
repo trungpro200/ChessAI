@@ -10,8 +10,22 @@ model = Model.ChessModel(token_dim=103)
 # 1.601748300017789s
 # print(Model.encode_board(board))
 
-e = Model.encode_board_init(board).to(device).unsqueeze(0)
-res = model(e)
+e = Model.encode_board_init(board)
+d = torch.Tensor(e)
 
-print(res)
-print(res[0].shape)
+def test():
+    d.copy_(e)
+    Model.encode_board_propagate(d, board, (1,1))
+    # print(d[:, 0:12])
+    # print(d[:, 12:24])
+
+torch.set_printoptions(profile='full')
+test()
+
+# print(e[:, 12:24])
+
+timer = timeit.Timer(test)
+
+t = timer.timeit(10000)
+
+print(t)
