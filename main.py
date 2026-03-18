@@ -3,29 +3,35 @@ import Model
 import torch
 import timeit 
 from Model.device import device
+import copy
 
-board = chess.Board.from_fen('rnbqkbnr/1pppp1pp/p7/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3')
+board = chess.Board()
 model = Model.ChessModel(token_dim=103)
 
-# 1.601748300017789s
+# 1.601748300017789s -> 0.357 -> 0.5
 # print(Model.encode_board(board))
+tokens = Model.Tokens(board)
 
-e = Model.encode_board_init(board)
-d = torch.Tensor(e)
+moves = [
+    Model.encode_move(chess.Move.from_uci('g1f3')),
+    Model.encode_move(chess.Move.from_uci('g8f6')),
+    Model.encode_move(chess.Move.from_uci('f3g1')),
+    Model.encode_move(chess.Move.from_uci('f6g8')),
+]
 
-def test():
-    d.copy_(e)
-    Model.encode_board_propagate(d, board, (1,1))
-    # print(d[:, 0:12])
-    # print(d[:, 12:24])
 
+def history_test():
+    for move in moves:
+        tokens.encode_board_propagate(move)
+
+# timer = timeit.Timer(history_test)
+
+# t = timer.timeit(2500)
+# print(t)
+
+# history_test()
+history_test()
 torch.set_printoptions(profile='full')
-test()
-
+print(tokens.tokens[:, 0:96])
+# print(tokens.tokens[:, 0:96])
 # print(e[:, 12:24])
-
-timer = timeit.Timer(test)
-
-t = timer.timeit(10000)
-
-print(t)

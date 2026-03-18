@@ -104,7 +104,7 @@ def decode_move(board: chess.Board, action: tuple[int, int] ):
     entry = MOVE_TABLE[from_sq][plane]
 
     if entry is None:
-        return None
+        return
 
     to_sq, promo = entry
     
