@@ -29,9 +29,13 @@ def history_test():
 # t = timer.timeit(2500)
 # print(t)
 
-# history_test()
 history_test()
+# history_test()
+
+# for plane in tokens.history_planes:
+#     print(plane[:, 7].view(8,8))
+
 torch.set_printoptions(profile='full')
-print(tokens.tokens[:, 0:96])
+print(tokens.tokens)
 # print(tokens.tokens[:, 0:96])
 # print(e[:, 12:24])
