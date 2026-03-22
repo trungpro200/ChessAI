@@ -34,7 +34,7 @@ class Node:
 class SelfPlay:
     def __init__(self, model: ChessModel, num_simulations=200, temperature=1.0):
         self.model = model
-        self.num_simulations = num_simulations
+        self.num_simulations = 50
         self.temperature = temperature
 
         self.TT: dict[int, Node] = {}   # zobrist -> Node
@@ -63,7 +63,7 @@ class SelfPlay:
             move = self.sample_move(pi)
 
             # apply move
-            print(decode_move(state.board, move), self.TT[zhash].N)
+            print(decode_move(state.board, move), sum(self.TT[zhash].N.values()))
             state.make_move(move)
 
         # game finished → assign values

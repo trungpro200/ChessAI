@@ -1,7 +1,7 @@
 import bulletchess as chess
 import torch
 import numpy as np
-from .device import device
+from device import device
 
 PLANES = 73
 
@@ -24,6 +24,14 @@ def xy_to_square(x,y) ->int | None:
         return None
     return y*8 + x
 
+def flip_square(sq: int) -> int:
+    return sq ^ 56
+def flip_move(move: chess.Move) -> chess.Move:
+    return chess.Move(
+        chess.SQUARES_FLIPPED[move.origin.index()],
+        chess.SQUARES_FLIPPED[move.destination.index()],
+        move.promotion
+    )
 MOVE_TABLE:list = [[None]*PLANES for _ in range(64)]
 
 for from_sq in range(64):
@@ -108,27 +116,40 @@ def decode_move(board: chess.Board, action: tuple[int, int] ):
 
     to_sq, promo = entry
     
-    f_square = chess.SQUARES[from_sq]
     t_square = chess.SQUARES[to_sq]
     
+    if board.turn == chess.BLACK:
+        f_square = chess.SQUARES[flip_square(from_sq)]
+    else:
+        f_square = chess.SQUARES[from_sq]
+        
     piece = board[f_square].piece_type  # type: ignore
 
     if promo == None and piece is chess.PAWN and t_square in (chess.RANK_8 | chess.RANK_1):
         promo = chess.QUEEN
+    move = chess.Move(chess.SQUARES[from_sq], chess.SQUARES[to_sq], promo) # type: ignore
     
-    return chess.Move(chess.SQUARES[from_sq], chess.SQUARES[to_sq], promo) # type: ignore
+     # flip move back
+    if board.turn == chess.BLACK:
+        move = flip_move(move)
 
-def encode_move(move: chess.Move | None):
+    return move
+
+def encode_move(move: chess.Move | None, board: chess.Board):
+    if board.turn == chess.BLACK:
+        move = flip_move(move) #type: ignore
     key = (move.origin.index(), move.destination.index(), None if move.promotion is chess.QUEEN else move.promotion) # type: ignore
 
+    if board.turn == chess.BLACK: # Flip back
+        move = flip_move(move) #type: ignore
+    
     return ENCODE_TABLE[key]
 
 def test_roundtrip(board, uci):
 
     move = chess.Move.from_uci(uci)
 
-    action = encode_move(move)
-
+    action = encode_move(move, board) #type: ignore
     decoded = decode_move(board, action)
 
     print("move:", move)
@@ -139,7 +160,7 @@ def test_roundtrip(board, uci):
 
 def roundtrip_cases():
     board = chess.Board()
-    board.apply(None)
+    # board.apply(None)
 
     test_roundtrip(board, "e2e4")
     test_roundtrip(board, "d2d4")
@@ -174,6 +195,12 @@ def roundtrip_cases():
     board = chess.Board.from_fen("8/P7/8/8/8/8/8/k6K w - - 0 1")
 
     test_roundtrip(board, "a7a8q")
+    
+    board = chess.Board.from_fen("1nb1kbnr/pppppp1p/8/8/BP6/KN6/PPQ1PPpP/R7 b k - 0 1")
+    test_roundtrip(board, "g2f1r")
+    test_roundtrip(board, "g2g1r")
+    test_roundtrip(board, "g2h1r")
+    
 
 if __name__ == "__main__":
     board = chess.Board()

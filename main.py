@@ -16,15 +16,19 @@ buffer = deque()
 # print(Model.encode_board(board))
 tokens = Model.State(board)
 moves = [
-    Model.encode_move(chess.Move.from_uci('g1f3')),
-    Model.encode_move(chess.Move.from_uci('g8f6')),
-    Model.encode_move(chess.Move.from_uci('f3g1')),
-    Model.encode_move(chess.Move.from_uci('f6g8')),
+    Model.encode_move(chess.Move.from_uci('g1f3'), board),
+    Model.encode_move(chess.Move.from_uci('g8f6'), board),
+    Model.encode_move(chess.Move.from_uci('f3g1'), board),
+    Model.encode_move(chess.Move.from_uci('f6g8'), board),
 ]
 
-sp = Model.SelfPlay(model)
-sp.play_game(tokens)
+sq = chess.B7
 
-print(Model.GLOBAL_BUFFER)
+print(chess.SQUARES_FLIPPED[sq.index()])
+
+# sp = Model.SelfPlay(model)
+# sp.play_game(tokens)
+
+# print(Model.GLOBAL_BUFFER)
 
 # tokens = tokens.tokens.unsqueeze(0).to('cuda')
