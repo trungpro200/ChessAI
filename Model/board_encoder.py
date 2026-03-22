@@ -7,20 +7,28 @@ PIECES = [chess.Piece(chess.WHITE, x) for x in chess.PIECE_TYPES] + [chess.Piece
 PIECES_INT_DICT: dict[chess.Piece] = dict([reversed(x) for x in enumerate(PIECES)])  # type: ignore
 
 
-class Tokens:
-    def __init__(self, board: chess.Board) -> None:
+class State:
+    def __init__(self, board: chess.Board, init_board = True) -> None:
         self.board = board
         self.head = 0
         
         self.history_planes = torch.zeros(8, 64, 12, dtype=torch.float32)
         self.meta_planes = torch.zeros(64,7)
         
-        self.encode_board_init(board)
+        if init_board:
+            self.encode_board_init(board)
     
     @staticmethod
     def to_signed_64(x):
         return (x + (1 << 63)) % (1 << 64) - (1 << 63)
 
+    def clone(self) -> "State":
+        cp = State(self.board, False)
+        
+        cp.history_planes = self.history_planes.clone()
+        cp.head = self.head
+        
+        return cp
     def bitboards_to_tensor(self, bitboards: list[int]):
         bb = torch.tensor(bitboards, dtype=torch.int64)  # [12]
         bits = ((bb[:, None] >> SHIFTS) & 1).to(torch.float32)  # [12,64]
@@ -65,7 +73,7 @@ class Tokens:
         self.update_metadata()
         
 
-    def encode_board_propagate(self, action):
+    def make_move(self, action):
         h_plane = self.history_planes
         board = self.board
 
@@ -118,12 +126,11 @@ class Tokens:
         # Update head 
         self.head = new_head
 
-        self.update_metadata()
-
         return h_plane
     
     @property
-    def tokens(self):
+    def tokens(self): # Reorder to feed into NN
+        self.update_metadata()
         pos = self.history_planes.roll(-self.head, dims=0)
         pos = pos.reshape(64, -1)
         return torch.cat((pos, self.meta_planes), dim=1)

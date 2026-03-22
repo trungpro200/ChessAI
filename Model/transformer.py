@@ -11,8 +11,14 @@ class ChessInputEmbedding(nn.Module):
         
         self.pos_offset = nn.Parameter(torch.randn(64, d_model))
 
-    def forward(self, x):
+    def forward(self, x:torch.Tensor):
         # x shape: [batch_size, 64, 112]
+        if x.device != device:
+            x = x.to(device)
+        
+        if len(x.shape)<3:
+            x = x.unsqueeze(0)
+        
         x = self.projection(x) # Chuyển thành [batch_size, 64, d_model]
         
         # Cộng thêm thông tin vị trí tuyệt đối
@@ -122,13 +128,14 @@ class ChessHeads(nn.Module):
     def __init__(self, d_model=256):
         super().__init__()
         # Policy Head: Chiếu body output thành Query (ô đi) và Key (ô đến)
-        self.policy_head = nn.Linear(d_model, 73)
+        self.policy_head = nn.Linear(d_model, 73) # Shape = [64,73]
         
-        # Value Head: Dự đoán Win/Draw/Loss
+        # Value Head: Dự đoán value từ góc nhìn của người chơi bên trắng
         self.value_net = nn.Sequential(
             nn.Linear(d_model, 128),
             nn.Mish(),
-            nn.Linear(128, 3) 
+            nn.Linear(128, 1),
+            nn.Tanh()
         )
         
         self.to(device)
