@@ -108,10 +108,6 @@ class SelfPlay:
                 # Apply values/ Remove virtual loss
                 # print(VIRTUAL_LOSS+(value*turn_value))
                 self.backpropagate(path, value, increase_visit=False, undo_move=False, board=turn_value, v_loss=-VIRTUAL_LOSS) # type: ignore
-                
-            print(self.TT[root_hash].N, end="\n=======================\n")
-            print(self.TT[root_hash].W, end="\n=======================\n")
-            print(self.TT[root_hash].Q, end="\n=======================\n")   
             
 
     def simulate(self, root_state: State, zhash, paths: deque[deque[tuple]]):
