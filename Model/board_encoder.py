@@ -133,4 +133,4 @@ class State:
         self.update_metadata()
         pos = self.history_planes.roll(-self.head, dims=0)
         pos = pos.reshape(64, -1)
-        return torch.cat((pos, self.meta_planes), dim=1)
+        return torch.cat((pos, self.meta_planes), dim=1).unsqueeze(0)

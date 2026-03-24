@@ -12,6 +12,8 @@ import torch, random, gc
 CPUCT = 1.5
 GLOBAL_BUFFER = deque()
 TERMINAL_STATES = [chess.THREEFOLD_REPETITION, chess.FIFTY_MOVE_TIMEOUT, chess.STALEMATE, chess.CHECKMATE]
+VIRTUAL_LOSS = 1
+
 def is_terminal(board: chess.Board):
     for state in TERMINAL_STATES:
         if board in state:
@@ -28,18 +30,24 @@ class Node:
         self.N: dict[tuple, int] = {}            # visit count per move
         self.W: dict[tuple, float] = {}            # total value per move
         self.Q: dict[tuple, float] = {}            # mean value per move
-
-        self.expanded = False
+        
+        # for move in self.P.keys():
+        #     self.N[move] = 0
+        #     self.W[move] = 0
+        #     self.Q[move] = 0
+        
+        self.is_terminal:dict[tuple, bool] = {} # move -> terminal state
 
 class SelfPlay:
-    def __init__(self, model: ChessModel, num_simulations=200, temperature=1.0):
+    def __init__(self, model: ChessModel, num_simulations=200, temperature=1.0, batch_size=32):
         self.model = model
-        self.num_simulations = 50
+        self.num_simulations = num_simulations
         self.temperature = temperature
+        self.batch_size = batch_size
 
         self.TT: dict[int, Node] = {}   # zobrist -> Node
         
-        model.eval()
+        self.model.eval()
 
     # =========================
     # PUBLIC ENTRY POINT
@@ -63,7 +71,7 @@ class SelfPlay:
             move = self.sample_move(pi)
 
             # apply move
-            print(decode_move(state.board, move), sum(self.TT[zhash].N.values()))
+            # print(decode_move(state.board, move), sum(self.TT[zhash].N.values()))
             state.make_move(move)
 
         # game finished → assign values
@@ -78,55 +86,101 @@ class SelfPlay:
         root_hash = root_state.board.__hash__()
 
         for _ in range(self.num_simulations):
-            state = root_state.clone()
+
+            paths: deque[deque[tuple]] = deque() # hash, move
+            with torch.no_grad():
+                batch = self.simulate(root_state, root_hash, paths)
+                p, v = self.model(batch)
+            p: torch.Tensor 
+            v: torch.Tensor
+            # print(paths)
+            for i, path in enumerate(paths): # Apply policies, values
+                turn_value = path.pop()
+                leaf_hash, leaf_move = path[-1]
+                leaf_node = self.TT[leaf_hash] # hash, move
+                policies = p[i]
+                value = v[i].item()
+                
+                # Apply policies
+                for move in leaf_node.P:
+                    leaf_node.P[move] = policies[move].item()
+                    
+                # Apply values/ Remove virtual loss
+                # print(VIRTUAL_LOSS+(value*turn_value))
+                self.backpropagate(path, value, increase_visit=False, undo_move=False, board=turn_value, v_loss=-VIRTUAL_LOSS) # type: ignore
+                
+            print(self.TT[root_hash].N, end="\n=======================\n")
+            print(self.TT[root_hash].W, end="\n=======================\n")
+            print(self.TT[root_hash].Q, end="\n=======================\n")   
             
 
-            path: deque[tuple] = deque()
-            value = self.simulate(state, root_hash, path)
+    def simulate(self, root_state: State, zhash, paths: deque[deque[tuple]]):
+        batch = []
+        path: deque[tuple] = deque()
+        
+        root_hash = root_state.board.__hash__()
+        
+        for i in range(self.batch_size):
+            state = root_state.clone()
+            path.clear()
+            
+            while True: # Travelling
+                if zhash not in self.TT: # Unexpanded node
+                    # expand
+                    # with torch.no_grad():
+                    #     policy, value = self.model(state.tokens)
+                    #     masked_p: dict[tuple, float] = dict()
+                    
+                    policies = {}
+                    node = Node(policies)
+                    for lmove in state.board.legal_moves():
+                        e = encode_move(lmove, state.board)
+                        policies[e] = 0
+                        node.N[e] = 1
+                        node.W[e] = -1
 
-            self.backpropagate(path, value, state.board)
-
-    def simulate(self, state: State, zhash, path: deque[tuple]):
-        while True:
-            if zhash not in self.TT:
-                # expand
-                with torch.no_grad():
-                    policy, value = self.model(state.tokens)
-                    masked_p: dict[tuple, float] = dict()
+                    self.TT[zhash] = node
+                    
+                    # Append to the batch for GPU
+                    batch.append(state.tokens)
+                    
+                    # adding an int that represent current turn for back-prop when the batch is full (-1 for black, 1 for white)
+                    turn_value = int(not state.board.turn==chess.WHITE)*2-1
+                    
+                    self.backpropagate(path,value=0, v_loss=VIRTUAL_LOSS, board=state.board) # Apply virtual loss
+                    
+                    path.append(turn_value) #type: ignore // do this after back prop to not break it
+                    
+                    if zhash != root_hash: # No path needed if we're expanding root node
+                        paths.append(path.copy())
+                    
+                    zhash = root_hash # travel from the root again
+                    break
                 
-                policy: torch.Tensor
-                value: torch.Tensor
+                # Travelling down
+                node = self.TT[zhash]
+
+                move = self.select_move(node)
+
+                path.append((zhash, move))
+                state.make_move(move)
+
+                # If the node is a terminal 
+                terminal_state = is_terminal(state.board)
+                if terminal_state is not None:
+                    self.backpropagate(path, value = terminal_state, board=state.board)
+                    self.TT[zhash].is_terminal[move] = True
+                    zhash = root_hash
+                    break
                 
-                for lmove in state.board.legal_moves():
-                    e = encode_move(lmove)
-                    masked_p[e] = policy[0, *e].item()
-
-                node = Node(masked_p)
-                self.TT[zhash] = node
+                zhash = state.board.__hash__()
                 
-                # for obj in gc.get_objects():
-                #     try:
-                #         if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-                #             if obj.device == 'cuda':
-                #                 print(type(obj), obj.size())
-                #     except:
-                #         pass
-                return value
+        
+        # print(*paths, sep='\n')
+        batch = torch.concat(batch)
+        return batch
 
-            node = self.TT[zhash]
-
-            move = self.select_move(node)
-
-            path.append((zhash, move))
-
-            state.make_move(move)
-            zhash = state.board.__hash__()
-
-            terminal_state = is_terminal(state.board)
-            if terminal_state is not None:
-                return terminal_state
-
-    def select_move(self, node: Node):
+    def select_move(self, node: Node)-> tuple:
         total_N = sum(node.N.values())
 
         best_score = -1e9
@@ -140,20 +194,31 @@ class SelfPlay:
             if score > best_score:
                 best_score = score
                 best_move = move
+        return best_move # type: ignore
 
-        return best_move
 
-    def backpropagate(self, path: deque[tuple], value, board: chess.Board):
+    def backpropagate(self, path: deque[tuple], value, increase_visit = True, undo_move = True, board: chess.Board | None = None, v_loss = 0):
+        # Revert on demand or on turn
+        if isinstance(board, chess.Board):
+            if board.turn == chess.WHITE:
+                value = -value
+        elif isinstance(board, int):
+            value *=board
+
+        
+        iv = int(increase_visit)
+        
         for hash, move in reversed(path):
             node = self.TT[hash]
             node: Node
             move: tuple
-            node.N[move] = node.N.get(move, 0) + 1
-            node.W[move] = node.W.get(move, 0) + value
+            node.N[move] = node.N.get(move, 0) + v_loss + iv
+            node.W[move] = node.W.get(move, 0) + value - v_loss
             node.Q[move] = node.W[move] / node.N[move]
-            
-            board.undo()
             value = -value  # switch player
+            
+            if undo_move and isinstance(board, chess.Board):
+                board.undo()
 
     # =========================
     # POLICY + SAMPLING

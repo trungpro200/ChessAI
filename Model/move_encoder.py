@@ -1,7 +1,7 @@
 import bulletchess as chess
 import torch
 import numpy as np
-from device import device
+from .device import device
 
 PLANES = 73
 
@@ -200,6 +200,31 @@ def roundtrip_cases():
     test_roundtrip(board, "g2f1r")
     test_roundtrip(board, "g2g1r")
     test_roundtrip(board, "g2h1r")
+    
+        # --- Black normal moves (mirror of white opening ideas) ---
+    board = chess.Board()
+
+    board.apply(chess.Move.from_uci("e2e4"))
+    test_roundtrip(board, "e7e5")
+
+    board = chess.Board()
+    board.apply(chess.Move.from_uci("d2d4"))
+    test_roundtrip(board, "d7d5")
+
+    board = chess.Board()
+    board.apply(chess.Move.from_uci("g1f3"))
+    test_roundtrip(board, "g8f6")
+
+    board = chess.Board()
+    board.apply(chess.Move.from_uci("b1c3"))
+    test_roundtrip(board, "b8c6")
+    
+    # --- Black to move custom position ---
+    board = chess.Board.from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+
+    test_roundtrip(board, "c7c5")
+    test_roundtrip(board, "e7e6")
+    test_roundtrip(board, "g8f6")
     
 
 if __name__ == "__main__":
