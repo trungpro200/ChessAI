@@ -15,11 +15,13 @@ TERMINAL_STATES = [chess.THREEFOLD_REPETITION, chess.FIFTY_MOVE_TIMEOUT, chess.S
 VIRTUAL_LOSS = 1
 
 def is_terminal(board: chess.Board):
+    if board.halfmove_clock >= 8:
+        return 0
+    
     for state in TERMINAL_STATES:
         if board in state:
             if state == chess.CHECKMATE:
                 return int(board.turn != chess.WHITE)*2 - 1
-    
     return None
 
 
@@ -27,14 +29,11 @@ def is_terminal(board: chess.Board):
 class Node:
     def __init__(self, policy: dict[tuple, float]):
         self.P = policy        # prior probabilities (dict: move -> prob)
+        
+        # dicts: move -> value
         self.N: dict[tuple, int] = {}            # visit count per move
         self.W: dict[tuple, float] = {}            # total value per move
         self.Q: dict[tuple, float] = {}            # mean value per move
-        
-        # for move in self.P.keys():
-        #     self.N[move] = 0
-        #     self.W[move] = 0
-        #     self.Q[move] = 0
         
         self.is_terminal:dict[tuple, bool] = {} # move -> terminal state
 
@@ -54,8 +53,14 @@ class SelfPlay:
     # =========================
     def play_game(self, state: State):
         game_data = []
+        step = 0
 
         while is_terminal(state.board) is None:
+            if step >= 30:
+                self.temperature = 0.0
+            else:
+                self.temperature = 1.0
+            
             zhash = state.board.__hash__()
 
             # run MCTS
@@ -73,9 +78,14 @@ class SelfPlay:
             # apply move
             # print(decode_move(state.board, move), sum(self.TT[zhash].N.values()))
             state.make_move(move)
+            # print(move, self.TT[zhash].N[move]) 
+            # print(state.board.pretty()) # Debug line
+            
+            step += 1
 
         # game finished → assign values
-        outcome = is_terminal(state.board)  # +1 / 0 / -1
+        outcome = is_terminal(state.board)  # +1 / 0 / -1 from white perspective as always
+        # print(outcome)
 
         return self.assign_values(game_data, outcome, GLOBAL_BUFFER)
 
@@ -249,8 +259,7 @@ class SelfPlay:
         else:
             results = deque()
 
-        for state_enc, pi, player in game_data:
-            value = outcome if player == 1 else -outcome
-            results.append((state_enc, pi, value))
+        for state_enc, pi in game_data:
+            results.append((state_enc, pi, outcome))
 
         return results
