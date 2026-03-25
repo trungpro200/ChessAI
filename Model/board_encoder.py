@@ -1,6 +1,7 @@
 import torch
 import bulletchess as chess
 from .move_encoder import encode_move, decode_move
+from collections import deque
 
 SHIFTS = torch.arange(64, dtype=torch.int64)
 PIECES = [chess.Piece(chess.WHITE, x) for x in chess.PIECE_TYPES] + [chess.Piece(chess.BLACK, x) for x in chess.PIECE_TYPES] 
@@ -10,10 +11,12 @@ PIECES_INT_DICT: dict[chess.Piece] = dict([reversed(x) for x in enumerate(PIECES
 class State:
     def __init__(self, board: chess.Board, init_board = True) -> None:
         self.board = board
-        self.head = 0
         
-        self.history_planes = torch.zeros(8, 64, 12, dtype=torch.float32)
+        self.history_planes = torch.zeros(64, 96, dtype=torch.float32)
         self.meta_planes = torch.zeros(64,7)
+        self.pos_cache:dict[int, torch.Tensor] = {} # hash -> [12,64]
+        
+        self.move_stack: deque[int] = deque()
         
         if init_board:
             self.encode_board_init(board)
@@ -21,17 +24,10 @@ class State:
     @staticmethod
     def to_signed_64(x):
         return (x + (1 << 63)) % (1 << 64) - (1 << 63)
-
-    def clone(self) -> "State":
-        cp = State(self.board, False)
-        
-        cp.history_planes = self.history_planes.clone()
-        cp.head = self.head
-        
-        return cp
+    
     def bitboards_to_tensor(self, bitboards: list[int]):
         bb = torch.tensor(bitboards, dtype=torch.int64)  # [12]
-        bits = ((bb[:, None] >> SHIFTS) & 1).to(torch.float32)  # [12,64]
+        bits = ((bb[:, None] >> SHIFTS) & 1).to(torch.bool)  # [12,64]
         return bits.transpose(0, 1)  # [64,12]
 
     def update_metadata(self):
@@ -57,7 +53,7 @@ class State:
         # Repetition - 1 layer
         meta[:, 6] = board.halfmove_clock*0.01 # This is good enough
 
-    def encode_board_init(self, board: chess.Board): # -> [64, 103]
+    def encode_board_init(self, board: chess.Board): # Create the root board state and put into histories
         """## Tokenization
         
         Encode board into 64 tokens [64,103]
@@ -69,15 +65,15 @@ class State:
             101: en-passant
             102: repetition
         """
-        self.history_planes[0] = self.bitboards_to_tensor([self.to_signed_64(int(board[x])) for x in PIECES])
-        self.update_metadata()
+        self.pos_cache[board.__hash__()] = self.bitboards_to_tensor([self.to_signed_64(int(board[x])) for x in PIECES])
         
 
     def make_move(self, action):
-        h_plane = self.history_planes
         board = self.board
 
         move: chess.Move = decode_move(board, action) #type: ignore
+        
+        # assert move in board.legal_moves(), "Ilegal move"
 
         origin = move.origin.index()
         dest = move.destination.index()
@@ -86,15 +82,19 @@ class State:
         ep = board.en_passant_square
         turn = board.turn
 
-        # Rotate head 
-        new_head = (self.head - 1) % 8
-        prev_head = self.head
-
-        curr = h_plane[new_head]
-        prev = h_plane[prev_head]
-
+        prev = self.pos_cache[board.__hash__()]
+        
+        # Apply move to board 
+        board.apply(move)
+        curr_hash = board.__hash__()
+        
+        self.move_stack.append(curr_hash)
+        
+        if self.pos_cache.get(curr_hash) is not None: # Already generated
+            return
+        
         # Copy previous board
-        curr.copy_(prev)
+        curr = prev.clone()
 
         # Handle en-passant capture 
         if ep and piece.piece_type == chess.PAWN and dest == ep.index():
@@ -120,17 +120,24 @@ class State:
             curr[rook_to] = prev[rook_from]
             curr[rook_from] = 0
 
-        # Apply move to board 
-        board.apply(move)
+        self.pos_cache[board.__hash__()] = curr
 
-        # Update head 
-        self.head = new_head
-
-        return h_plane
+        return curr
+    
+    def unmake_move(self):
+        self.board.undo()
+        self.move_stack.pop()
     
     @property
     def tokens(self): # Reorder to feed into NN
         self.update_metadata()
-        pos = self.history_planes.roll(-self.head, dims=0)
-        pos = pos.reshape(64, -1)
-        return torch.cat((pos, self.meta_planes), dim=1).unsqueeze(0)
+        
+        size = min(len(self.move_stack), 8)
+        
+        if size < 8:
+            self.history_planes.zero_()
+        
+        for i in range(min(len(self.move_stack), 8)):
+            pos = self.pos_cache[self.move_stack[i]]
+            self.history_planes[:, i*12:(i+1)*12] = pos
+        return torch.cat((self.history_planes, self.meta_planes), dim=1).unsqueeze(0)

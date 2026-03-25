@@ -17,7 +17,7 @@ buffer = deque()
 # print(Model.encode_board(board))
 state = Model.State(board)
 
-sp = Model.SelfPlay(model, 20, temperature=1)
+sp = Model.SelfPlay(model, 20, batch_size=64)
 sp.play_game(state)
 
 print(Model.GLOBAL_BUFFER)

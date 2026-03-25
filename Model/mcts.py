@@ -15,7 +15,7 @@ TERMINAL_STATES = [chess.THREEFOLD_REPETITION, chess.FIFTY_MOVE_TIMEOUT, chess.S
 VIRTUAL_LOSS = 1
 
 def is_terminal(board: chess.Board):
-    if board.halfmove_clock >= 8:
+    if board.halfmove_clock >= 24:
         return 0
     
     for state in TERMINAL_STATES:
@@ -76,10 +76,10 @@ class SelfPlay:
             move = self.sample_move(pi)
 
             # apply move
-            # print(decode_move(state.board, move), sum(self.TT[zhash].N.values()))
+            # print(decode_move(state.board, move).san(state.board), state.board.halfmove_clock)
             state.make_move(move)
             # print(move, self.TT[zhash].N[move]) 
-            # print(state.board.pretty()) # Debug line
+            print(state.board.pretty()) # Debug line
             
             step += 1
 
@@ -117,7 +117,7 @@ class SelfPlay:
                     
                 # Apply values/ Remove virtual loss
                 # print(VIRTUAL_LOSS+(value*turn_value))
-                self.backpropagate(path, value, increase_visit=False, undo_move=False, board=turn_value, v_loss=-VIRTUAL_LOSS) # type: ignore
+                self.backpropagate(path, value, increase_visit=False, undo_move=False, demand_flip=turn_value, v_loss=-VIRTUAL_LOSS, state=root_state) # type: ignore
             
 
     def simulate(self, root_state: State, zhash, paths: deque[deque[tuple]]):
@@ -127,7 +127,6 @@ class SelfPlay:
         root_hash = root_state.board.__hash__()
         
         for i in range(self.batch_size):
-            state = root_state.clone()
             path.clear()
             
             while True: # Travelling
@@ -139,8 +138,8 @@ class SelfPlay:
                     
                     policies = {}
                     node = Node(policies)
-                    for lmove in state.board.legal_moves():
-                        e = encode_move(lmove, state.board)
+                    for lmove in root_state.board.legal_moves():
+                        e = encode_move(lmove, root_state.board)
                         policies[e] = 0
                         node.N[e] = 1
                         node.W[e] = -1
@@ -148,12 +147,12 @@ class SelfPlay:
                     self.TT[zhash] = node
                     
                     # Append to the batch for GPU
-                    batch.append(state.tokens)
+                    batch.append(root_state.tokens)
                     
                     # adding an int that represent current turn for back-prop when the batch is full (-1 for black, 1 for white)
-                    turn_value = int(not state.board.turn==chess.WHITE)*2-1
+                    turn_value = int(not root_state.board.turn==chess.WHITE)*2-1
                     
-                    self.backpropagate(path,value=0, v_loss=VIRTUAL_LOSS, board=state.board) # Apply virtual loss
+                    self.backpropagate(path, value=0, v_loss=VIRTUAL_LOSS, state=root_state) # Apply virtual loss
                     
                     path.append(turn_value) #type: ignore // do this after back prop to not break it
                     
@@ -169,17 +168,17 @@ class SelfPlay:
                 move = self.select_move(node)
 
                 path.append((zhash, move))
-                state.make_move(move)
+                root_state.make_move(move)
 
                 # If the node is a terminal 
-                terminal_state = is_terminal(state.board)
+                terminal_state = is_terminal(root_state.board)
                 if terminal_state is not None:
-                    self.backpropagate(path, value = terminal_state, board=state.board)
+                    self.backpropagate(path, value = terminal_state, state=root_state)
                     self.TT[zhash].is_terminal[move] = True
                     zhash = root_hash
                     break
                 
-                zhash = state.board.__hash__()
+                zhash = root_state.board.__hash__()
                 
         
         # print(*paths, sep='\n')
@@ -203,13 +202,15 @@ class SelfPlay:
         return best_move # type: ignore
 
 
-    def backpropagate(self, path: deque[tuple], value, increase_visit = True, undo_move = True, board: chess.Board | None = None, v_loss = 0):
-        # Revert on demand or on turn
-        if isinstance(board, chess.Board):
+    def backpropagate(self, path: deque[tuple], value, state: State, increase_visit = True, undo_move = True, v_loss = 0, demand_flip = None):
+        board = state.board
+        
+        # Revert based on demand or on turn
+        if not demand_flip:
             if board.turn == chess.WHITE:
                 value = -value
-        elif isinstance(board, int):
-            value *=board
+        else:
+            value *= demand_flip
 
         
         iv = int(increase_visit)
@@ -224,7 +225,7 @@ class SelfPlay:
             value = -value  # switch player
             
             if undo_move and isinstance(board, chess.Board):
-                board.undo()
+                state.unmake_move()
 
     # =========================
     # POLICY + SAMPLING
