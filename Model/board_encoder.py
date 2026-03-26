@@ -12,7 +12,7 @@ class State:
     def __init__(self, board: chess.Board, init_board = True) -> None:
         self.board = board
         
-        self.history_planes = torch.zeros(64, 96, dtype=torch.float32)
+        self.history_planes = torch.zeros(64, 12, dtype=torch.float32)
         self.meta_planes = torch.zeros(64,7)
         self.pos_cache:dict[int, torch.Tensor] = {} # hash -> [12,64]
         
@@ -109,7 +109,7 @@ class State:
             curr[dest] = 0
             idx = PIECES_INT_DICT[chess.Piece(board.turn, move.promotion)]
             curr[dest, idx] = 1
-        elif piece.piece_type == chess.KING and abs(dest - origin) == 2:
+        elif move.is_castling(board): # Castling
             if dest > origin:  # kingside
                 rook_from = origin + 3
                 rook_to = origin + 1
@@ -132,12 +132,10 @@ class State:
     def tokens(self): # Reorder to feed into NN
         self.update_metadata()
         
-        size = min(len(self.move_stack), 8)
+        size = min(len(self.move_stack), 4)
+        histories = [self.pos_cache[self.move_stack[i]] for i in range(size)]
         
-        if size < 8:
-            self.history_planes.zero_()
+        if size < 4:
+            histories += [self.history_planes]*(4-size)
         
-        for i in range(min(len(self.move_stack), 8)):
-            pos = self.pos_cache[self.move_stack[i]]
-            self.history_planes[:, i*12:(i+1)*12] = pos
-        return torch.cat((self.history_planes, self.meta_planes), dim=1).unsqueeze(0)
+        return torch.cat((*histories, self.meta_planes), dim=1).unsqueeze(0)
