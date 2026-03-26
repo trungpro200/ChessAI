@@ -9,10 +9,55 @@ from collections import deque
 import torch, random, gc
 
 
-CPUCT = 1.5
+CPUCT = 1.41
 GLOBAL_BUFFER = deque()
 TERMINAL_STATES = [chess.THREEFOLD_REPETITION, chess.FIFTY_MOVE_TIMEOUT, chess.STALEMATE, chess.CHECKMATE]
 VIRTUAL_LOSS = 1
+
+PIECE_VALUES = {
+    chess.PAWN: 100,   # pawn
+    chess.KNIGHT: 320,   # knight
+    chess.BISHOP: 330,   # bishop
+    chess.ROOK: 500,   # rook
+    chess.QUEEN: 900,   # queen
+    chess.KING: 20000  # king (just for completeness)
+}
+
+def mvv_lva_score(board: chess.Board, move: chess.Move):
+    # No capture → lowest priority
+    victim_piece: chess.Piece = board[move.destination] #type: ignore
+    attacker_piece: chess.Piece = board[move.origin] #type: ignore
+    
+    score = 0
+    
+    if attacker_piece.piece_type == chess.PAWN and move.destination == board.en_passant_square: # is_capture() won't detect enpassant so we do this :/
+        victim_value = PIECE_VALUES[chess.PAWN]
+        attacker_value = PIECE_VALUES[attacker_piece.piece_type]
+        score = victim_value * 10 - attacker_value
+    elif move.is_capture(board):
+        victim_value = PIECE_VALUES[victim_piece.piece_type]
+        attacker_value = PIECE_VALUES[attacker_piece.piece_type]
+        score = victim_value * 10 - attacker_value
+
+    # --- checks ---
+    board.apply(move)
+    if board in chess.CHECK:
+        score += 50
+    board.undo()
+    # --- castling ---
+    if move.is_castling(board):
+        score += 30
+
+    # MVV-LVA: maximize victim, minimize attacker
+    return score
+
+def debug_path(path: deque[tuple], board: chess.Board):
+    a = []
+    for hash, item in reversed(path):
+        board.undo()
+        a.append(decode_move(board, item))
+    
+    print(list(reversed(a)))
 
 def is_terminal(board: chess.Board):
     if board.halfmove_clock >= 24:
@@ -36,31 +81,53 @@ class Node:
         self.Q: dict[tuple, float] = {}            # mean value per move
         
         self.is_terminal:dict[tuple, bool] = {} # move -> terminal state
+        self.total_visit = 0
 
 class SelfPlay:
-    def __init__(self, model: ChessModel, num_simulations=200, temperature=1.0, batch_size=32):
+    def __init__(self, model: ChessModel, num_simulations=50, temperature=1.0, batch_size=64, late_mul=2, latethresh=25):
         self.model = model
         self.num_simulations = num_simulations
         self.temperature = temperature
         self.batch_size = batch_size
+        
+        self.latethresh = latethresh
+        self.late_mul = late_mul
 
         self.TT: dict[int, Node] = {}   # zobrist -> Node
-        
+        self.step = 0
         self.model.eval()
 
+    def get_num_sim(self):
+        if self.step <= self.latethresh:
+            num_sim = self.num_simulations
+        else:
+            num_sim = self.num_simulations*self.late_mul*self.late_mul # Increase search depth
+        return num_sim
+    
+    def get_batchsize(self):
+        if self.step <= self.latethresh:
+            batch_size = self.batch_size
+        else:
+            batch_size = int(self.batch_size/self.late_mul) # Lower search width
+        
+        return batch_size
+    
+    def get_cpuct(self):
+        if self.step <= self.latethresh:
+            c_puct = 2
+        else:
+            c_puct = CPUCT # Lower search width
+        
+        return c_puct
+    
     # =========================
     # PUBLIC ENTRY POINT
     # =========================
     def play_game(self, state: State):
         game_data = []
-        step = 0
+        self.step = 0
 
-        while is_terminal(state.board) is None:
-            if step >= 30:
-                self.temperature = 0.0
-            else:
-                self.temperature = 1.0
-            
+        while is_terminal(state.board) is None: 
             zhash = state.board.__hash__()
 
             # run MCTS
@@ -81,7 +148,7 @@ class SelfPlay:
             # print(move, self.TT[zhash].N[move]) 
             print(state.board.pretty()) # Debug line
             
-            step += 1
+            self.step += 1
 
         # game finished → assign values
         outcome = is_terminal(state.board)  # +1 / 0 / -1 from white perspective as always
@@ -94,39 +161,61 @@ class SelfPlay:
     # =========================
     def run_mcts(self, root_state: State):
         root_hash = root_state.board.__hash__()
+        
+        if self.TT.get(root_hash) is None: # Expand root first
+            policies = {}
+            node = Node(policies)
+            for lmove in sorted(root_state.board.legal_moves(), key=lambda x: mvv_lva_score(root_state.board, x), reverse=True):
+                e = encode_move(lmove, root_state.board)
+                policies[e] = 0
+                node.N[e] = 0
+                node.W[e] = 0
 
-        for _ in range(self.num_simulations):
+            self.TT[root_hash] = node
+        
+        
+        root_node = self.TT[root_hash]
+        
+        num_sim = self.get_num_sim()
+        bs = self.get_batchsize()
+
+        while root_node.total_visit < num_sim*bs:
 
             paths: deque[deque[tuple]] = deque() # hash, move
-            with torch.no_grad():
-                batch = self.simulate(root_state, root_hash, paths)
-                p, v = self.model(batch)
-            p: torch.Tensor 
-            v: torch.Tensor
-            # print(paths)
-            for i, path in enumerate(paths): # Apply policies, values
-                turn_value = path.pop()
-                leaf_hash, leaf_move = path[-1]
-                leaf_node = self.TT[leaf_hash] # hash, move
-                policies = p[i]
-                value = v[i].item()
-                
-                # Apply policies
-                for move in leaf_node.P:
-                    leaf_node.P[move] = policies[move].item()
+            batch = self.simulate(root_state, paths)
+            if batch != []:
+                with torch.no_grad():
+                    p, v = self.model(batch)
+                p: torch.Tensor 
+                v: torch.Tensor
+                # print(paths)
+                for i, path in enumerate(paths): # Apply policies, values
+                    turn_value = path.pop()
+                    leaf_hash, leaf_move = path[-1]
+                    leaf_node = self.TT[leaf_hash] # hash, move
+                    policies = p[i]
+                    # value = v[i].item()
+                    value = 0
                     
-                # Apply values/ Remove virtual loss
-                # print(VIRTUAL_LOSS+(value*turn_value))
-                self.backpropagate(path, value, increase_visit=False, undo_move=False, demand_flip=turn_value, v_loss=-VIRTUAL_LOSS, state=root_state) # type: ignore
+                    # Apply policies
+                    for move in leaf_node.P:
+                        leaf_node.P[move] = policies[move].item()
+                        
+                    # Apply values/ Remove virtual loss
+                    # print(VIRTUAL_LOSS+(value*turn_value))
+                    self.backpropagate(path, value, increase_visit=False, undo_move=False, demand_flip=turn_value, v_loss=-VIRTUAL_LOSS, state=root_state) # type: ignore
             
 
-    def simulate(self, root_state: State, zhash, paths: deque[deque[tuple]]):
+    def simulate(self, root_state: State, paths: deque[deque[tuple]]):
         batch = []
         path: deque[tuple] = deque()
         
         root_hash = root_state.board.__hash__()
+        zhash = root_hash
         
-        for i in range(self.batch_size):
+        batch_size = self.get_batchsize()
+        
+        for i in range(batch_size):
             path.clear()
             
             while True: # Travelling
@@ -138,11 +227,11 @@ class SelfPlay:
                     
                     policies = {}
                     node = Node(policies)
-                    for lmove in root_state.board.legal_moves():
+                    for lmove in sorted(root_state.board.legal_moves(), key=lambda x: mvv_lva_score(root_state.board, x), reverse=True):
                         e = encode_move(lmove, root_state.board)
                         policies[e] = 0
-                        node.N[e] = 1
-                        node.W[e] = -1
+                        node.N[e] = 0
+                        node.W[e] = 0
 
                     self.TT[zhash] = node
                     
@@ -165,7 +254,7 @@ class SelfPlay:
                 # Travelling down
                 node = self.TT[zhash]
 
-                move = self.select_move(node)
+                move = self.select_move(node, root_state.board)
 
                 path.append((zhash, move))
                 root_state.make_move(move)
@@ -173,6 +262,9 @@ class SelfPlay:
                 # If the node is a terminal 
                 terminal_state = is_terminal(root_state.board)
                 if terminal_state is not None:
+                    # print(terminal_state)
+                    # print(root_state.board.pretty())
+                    # debug_path(path, root_state.board.copy())
                     self.backpropagate(path, value = terminal_state, state=root_state)
                     self.TT[zhash].is_terminal[move] = True
                     zhash = root_hash
@@ -182,18 +274,21 @@ class SelfPlay:
                 
         
         # print(*paths, sep='\n')
-        batch = torch.concat(batch)
+        if batch:
+            batch = torch.concat(batch)
         return batch
 
-    def select_move(self, node: Node)-> tuple:
+    def select_move(self, node: Node, board: chess.Board)-> tuple:
         total_N = sum(node.N.values())
 
         best_score = -1e9
         best_move = None
+        
+        c_puct = self.get_cpuct()
 
         for move in node.P:
             Q = node.Q.get(move, 0)
-            U = CPUCT * node.P.get(move, 0) * math.sqrt(total_N + 1) / (1 + node.N.get(move, 0)) #type: ignore
+            U = c_puct * node.P.get(move, 0) * math.sqrt(total_N + 1) / (1 + node.N.get(move, 0)) #type: ignore
             score = Q + U #type: ignore
 
             if score > best_score:
@@ -219,9 +314,13 @@ class SelfPlay:
             node = self.TT[hash]
             node: Node
             move: tuple
+            
             node.N[move] = node.N.get(move, 0) + v_loss + iv
             node.W[move] = node.W.get(move, 0) + value - v_loss
             node.Q[move] = node.W[move] / node.N[move]
+            
+            node.total_visit += v_loss + iv
+            
             value = -value  # switch player
             
             if undo_move and isinstance(board, chess.Board):
@@ -235,13 +334,18 @@ class SelfPlay:
 
         visits = np.array(list(node.N.values()), dtype=np.float32)
         moves = list(node.N.keys())
+        
+        if self.step <= self.latethresh:
+            temperature = 1
+        else:
+            temperature = 0
 
-        if self.temperature == 0:
+        if temperature == 0:
             best = np.argmax(visits)
             pi = np.zeros_like(visits)
             pi[best] = 1.0
         else:
-            visits = visits ** (1 / self.temperature)
+            visits = visits ** (1 / temperature)
             pi = visits / visits.sum()
         
         return dict(zip(moves, pi))

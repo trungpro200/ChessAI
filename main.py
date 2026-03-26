@@ -7,9 +7,8 @@ import copy
 from collections import deque
 
 
-# board = chess.Board.from_fen("rnbqkbnr/pppp1ppp/8/4p3/5PP1/8/PPPPP2P/RNBQKBNR b KQkq f3 0 1")
-board = chess.Board()
-model = Model.ChessModel(token_dim=103)
+board = chess.Board.from_fen("1B1b1K2/3P1R2/1Np1k3/5pP1/1nRpb1P1/2Qp4/2N3p1/6q1 w - - 0 1")
+model = Model.ChessModel()
 
 buffer = deque()
 
@@ -17,10 +16,18 @@ buffer = deque()
 # print(Model.encode_board(board))
 state = Model.State(board)
 
-sp = Model.SelfPlay(model, 20, batch_size=64)
+sp = Model.SelfPlay(model, batch_size=32)
+
 sp.play_game(state)
 
-print(Model.GLOBAL_BUFFER)
+# print(Model.GLOBAL_BUFFER)
 
-# sp.simulate(state, state.board.__hash__(), deque())
-# print(Model.encode_move(chess.Move.from_uci('d8h4'), state.board))
+# moves = board.legal_moves()
+# score = {}
+# for move in moves:
+#     score[move] = Model.mvv_lva_score(board, move)
+
+# moves.sort(key=lambda x: score[x], reverse=True)
+
+# for move in moves:
+#     print(f"{move.san(board)} - {score[move]}")
