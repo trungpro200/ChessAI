@@ -116,7 +116,7 @@ class SelfPlay:
         if self.step <= self.latethresh:
             c_puct = 2
         else:
-            c_puct = CPUCT # Lower search width
+            c_puct = CPUCT # Do more accurate moves
         
         return c_puct
     
