@@ -20,7 +20,7 @@ PIECE_VALUES = {
     chess.BISHOP: 330,   # bishop
     chess.ROOK: 500,   # rook
     chess.QUEEN: 900,   # queen
-    chess.KING: 20000  # king (just for completeness)
+    chess.KING: 2000  # king (để cho đủ)
 }
 
 def mvv_lva_score(board: chess.Board, move: chess.Move):
@@ -30,7 +30,7 @@ def mvv_lva_score(board: chess.Board, move: chess.Move):
     
     score = 0
     
-    if attacker_piece.piece_type == chess.PAWN and move.destination == board.en_passant_square: # is_capture() won't detect enpassant so we do this :/
+    if is_enpassant(board, move): # is_capture() won't detect enpassant so we do this :/
         victim_value = PIECE_VALUES[chess.PAWN]
         attacker_value = PIECE_VALUES[attacker_piece.piece_type]
         score = victim_value * 10 - attacker_value
@@ -50,6 +50,17 @@ def mvv_lva_score(board: chess.Board, move: chess.Move):
 
     # MVV-LVA: maximize victim, minimize attacker
     return score
+
+def is_enpassant(board: chess.Board, move: chess.Move):
+    piece = board[move.origin]
+    if piece is None:
+        return False
+    if piece.piece_type != chess.PAWN:
+        return False
+    if move.destination == board.en_passant_square:
+        return True
+    
+    return False
 
 def debug_path(path: deque[tuple], board: chess.Board):
     a = []
@@ -82,6 +93,8 @@ class Node:
         
         self.is_terminal:dict[tuple, bool] = {} # move -> terminal state
         self.total_visit = 0
+        
+        self.matdiff: dict[tuple, float] = {}
 
 class SelfPlay:
     def __init__(self, model: ChessModel, num_simulations=50, temperature=1.0, batch_size=64, late_mul=2, latethresh=25):
@@ -114,7 +127,7 @@ class SelfPlay:
     
     def get_cpuct(self):
         if self.step <= self.latethresh:
-            c_puct = 2
+            c_puct = 2.5
         else:
             c_puct = CPUCT # Do more accurate moves
         
@@ -143,9 +156,10 @@ class SelfPlay:
             move = self.sample_move(pi)
 
             # apply move
-            # print(decode_move(state.board, move).san(state.board), state.board.halfmove_clock)
+            san = decode_move(state.board, move).san(state.board) #type: ignore
             state.make_move(move)
             # print(move, self.TT[zhash].N[move]) 
+            print(san, self.TT[zhash].matdiff.get(move, 0))
             print(state.board.pretty()) # Debug line
             
             self.step += 1
@@ -194,8 +208,7 @@ class SelfPlay:
                     leaf_hash, leaf_move = path[-1]
                     leaf_node = self.TT[leaf_hash] # hash, move
                     policies = p[i]
-                    # value = v[i].item()
-                    value = 0
+                    value = v[i].item()
                     
                     # Apply policies
                     for move in leaf_node.P:
@@ -211,12 +224,15 @@ class SelfPlay:
         path: deque[tuple] = deque()
         
         root_hash = root_state.board.__hash__()
+        root_node = self.TT[root_hash]
         zhash = root_hash
+        pzhash = None
         
         batch_size = self.get_batchsize()
         
         for i in range(batch_size):
             path.clear()
+            curr_diff = root_node.matdiff
             
             while True: # Travelling
                 if zhash not in self.TT: # Unexpanded node
@@ -227,11 +243,25 @@ class SelfPlay:
                     
                     policies = {}
                     node = Node(policies)
+                    node.matdiff = curr_diff
+                    
                     for lmove in sorted(root_state.board.legal_moves(), key=lambda x: mvv_lva_score(root_state.board, x), reverse=True):
                         e = encode_move(lmove, root_state.board)
                         policies[e] = 0
                         node.N[e] = 0
                         node.W[e] = 0
+                        
+                        turn_value = 2*int(root_state.board.turn == chess.WHITE) - 1
+                        
+                        if is_enpassant(root_state.board, lmove):
+                            node.matdiff[e] = 1 * turn_value
+                        if lmove.is_capture(root_state.board):
+                            captured: chess.Piece = root_state.board[lmove.destination] #type: ignore
+                            # print(root_state.board.pretty(), lmove.san(root_state.board), end='\n==================\n')
+                            node.matdiff[e] = turn_value * PIECE_VALUES[captured.piece_type]/100
+                            
+                            print(lmove.san(root_state.board))
+                            print(root_state.board.pretty())
 
                     self.TT[zhash] = node
                     
@@ -249,6 +279,7 @@ class SelfPlay:
                         paths.append(path.copy())
                     
                     zhash = root_hash # travel from the root again
+                    pzhash = None
                     break
                 
                 # Travelling down
@@ -258,6 +289,8 @@ class SelfPlay:
 
                 path.append((zhash, move))
                 root_state.make_move(move)
+                
+                curr_diff = self.TT[zhash].matdiff
 
                 # If the node is a terminal 
                 terminal_state = is_terminal(root_state.board)
@@ -267,10 +300,11 @@ class SelfPlay:
                     # debug_path(path, root_state.board.copy())
                     self.backpropagate(path, value = terminal_state, state=root_state)
                     self.TT[zhash].is_terminal[move] = True
-                    zhash = root_hash
+                    zhash = root_hash 
+                    pzhash = None
                     break
-                
-                zhash = root_state.board.__hash__()
+                pzhash = zhash
+                zhash = root_state.board.__hash__() # Travel down
                 
         
         # print(*paths, sep='\n')
@@ -285,11 +319,17 @@ class SelfPlay:
         best_move = None
         
         c_puct = self.get_cpuct()
+        
 
         for move in node.P:
             Q = node.Q.get(move, 0)
             U = c_puct * node.P.get(move, 0) * math.sqrt(total_N + 1) / (1 + node.N.get(move, 0)) #type: ignore
-            score = Q + U #type: ignore
+            
+            diff = node.matdiff.get(move, 0)*0.01
+            if board.turn == chess.BLACK:
+                diff = -diff
+            
+            score = Q + U + diff #type: ignore
 
             if score > best_score:
                 best_score = score
