@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 cozy-chess = "0.3.4"
+zmq = "0.10.0"

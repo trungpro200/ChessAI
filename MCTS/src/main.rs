@@ -1,11 +1,10 @@
-use cozy_chess::Board;
-
 // mod mcts;
-mod encoder;
+// mod encoder;
+mod api;
 
 
 fn main() {
-    let _board = Board::default();
+    let zmq = api::ZmqClient::new();
 
-    let pp = encoder::encode_board_build(&_board);
+    zmq.send();
 }
