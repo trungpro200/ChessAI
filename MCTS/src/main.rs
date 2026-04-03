@@ -1,3 +1,11 @@
+use cozy_chess::Board;
+
+// mod mcts;
+mod encoder;
+
+
 fn main() {
-    println!("Hello, world!");
+    let _board = Board::default();
+
+    let pp = encoder::encode_board_build(&_board);
 }
