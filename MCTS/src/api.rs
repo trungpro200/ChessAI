@@ -1,4 +1,4 @@
-use crate::encoder;
+use crate::encoder::*;
 use zmq;
 
 pub struct ZmqClient {
@@ -14,13 +14,7 @@ impl ZmqClient {
         Self { socket }
     }
 
-    pub fn send(&self, data: Vec<encoder::History>) {
-        // let batch: u32 = 4;
-        // let 
+    pub fn send(&self, data: &BatchBuffer) {
         
-
-        // let _res: Result<(), zmq::Error> = self
-        //     .socket
-        //     .send_multipart(&[&batch.to_le_bytes(), data_arr], 0);
     }
 }
