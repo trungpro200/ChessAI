@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = "1.25.0"
 cozy-chess = "0.3.4"
 zmq = "0.10.0"

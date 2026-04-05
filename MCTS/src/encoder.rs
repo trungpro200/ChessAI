@@ -1,7 +1,6 @@
-use cozy_chess::{Board, Color, Piece, Square};
+use cozy_chess::*;
 
 const HISTORY_LEN: usize = 8;
-const HISTORY_ARR: usize = HISTORY_LEN*12;
 
 
 
@@ -86,10 +85,18 @@ impl History {
 
             // 5: En Passant (Square-specific)
             // Only the specific EP square gets a 1.0
-            out_data[meta_start + 5] = if board.en_passant().map_or(false, |ep| ep as usize == sq) { 
-                1.0 
-            } else { 
-                0.0 
+            out_data[meta_start + 5] = if let Some(ep_file) = board.en_passant() {
+                // depending on whose turn it is.
+                let ep_rank = match board.side_to_move() {
+                    Color::White => Rank::Third, // White captures to 3rd rank
+                    Color::Black => Rank::Sixth, // Black captures to 6th rank
+                };
+                
+                // Construct the actual square and compare its 0-63 index to the current loop 'sq'
+                let target_sq = Square::new(ep_file, ep_rank);
+                if target_sq as usize == sq { 1.0 } else { 0.0 }
+            } else {
+                0.0
             };
 
             // 6: Halfmove Clock (Global)
@@ -99,7 +106,6 @@ impl History {
 }
 
 pub struct BatchBuffer {
-    // If batch size is 64: 64 * 8 * 768 = 393,216 floats (~1.5 MB)
     pub buffer: Vec<f32>, 
     pub batch_size: usize,
 }
@@ -107,14 +113,14 @@ pub struct BatchBuffer {
 impl BatchBuffer {
     pub fn new(batch_size: usize) -> Self {
         Self {
-            buffer: vec![0.0f32; batch_size * 8 * 768],
+            buffer: vec![0.0f32; batch_size * 64 * 103],
             batch_size,
         }
     }
 
     pub fn fill_slot(&mut self, slot_idx: usize, history: &History, board: &Board) {
-        let start = slot_idx * 8 * 768;
-        let end = start + 8 * 768;
+        let start = slot_idx * 64 * 103;
+        let end = start + 64 * 103;
         // Re-order the ring buffer into this specific slice of the flat buffer
         history.get_ordered_data(&mut self.buffer[start..end], board);
     }
