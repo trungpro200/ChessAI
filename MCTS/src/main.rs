@@ -9,18 +9,29 @@ use cozy_chess::*;
 use crate::{api::ZmqClient, encoder::BatchBuffer};
 
 fn main() {
-    let board: Board = Board::from_fen("rnbqkbnr/p1ppp1pp/1p6/4Pp2/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 3", false).unwrap();
-    board.null_move();
-    board.null_move();
-    board.null_move();
-    board.null_move();
-
     let mut h = encoder::History::default();
-    let zmq = ZmqClient::new();
+    let mut board: Board = Board::default();
+
     h.update(&board);
 
-    let mut batch = BatchBuffer::new(1);
+    board.play("g1f3".parse().unwrap());
+    h.update(&board);
+    board.play("g8f6".parse().unwrap());
+    h.update(&board);
+
+    board.play("f3g1".parse().unwrap());
+    h.update(&board);
+    board.play("f6g8".parse().unwrap());
+    h.update(&board);
+
+    let zmq = ZmqClient::new();
+    
+
+    let mut batch = BatchBuffer::new(4);
     batch.fill_slot(0, &h, &board);
+    batch.fill_slot(1, &h, &board);
+    batch.fill_slot(2, &h, &board);
+    batch.fill_slot(3, &h, &board);
 
     zmq.send(&batch);
 }

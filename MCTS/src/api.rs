@@ -1,5 +1,5 @@
 use crate::encoder::*;
-use zmq;
+use zmq::{self, Message};
 use bytemuck;
 
 pub struct ZmqClient {
@@ -17,11 +17,16 @@ impl ZmqClient {
 
     pub fn send(&self, data: &BatchBuffer) {
         let bytes: &[u8] = bytemuck::cast_slice(&data.buffer);
-        let batch_size_bytes: [u8; _] = data.batch_size.to_ne_bytes();
+        let batch_size_bytes: &[u8; _] = &data.batch_size.to_ne_bytes();
 
-        let res = self.socket.send_multipart(vec![
-            batch_size_bytes.as_slice(),
+        self.socket.send_multipart(vec![
+            batch_size_bytes,
             bytes
         ], 0);
+
+        let mut msg = Message::new();
+        self.socket.recv(&mut msg, 0).unwrap();
+
+        println!("{}", msg.as_str().unwrap());
     }
 }

@@ -7,7 +7,7 @@ class ChessModel(nn.Module):
     Args:
         tensor: return logits(policy, value)
     """
-    def __init__(self, d_model=256, n_layers=8, n_heads=8, token_dim = 55) -> None:
+    def __init__(self, d_model=256, n_layers=8, n_heads=8, token_dim = 103) -> None:
         super().__init__()
         
         self.CIE = ChessInputEmbedding(input_dim=token_dim, d_model=d_model)
