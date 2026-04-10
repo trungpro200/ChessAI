@@ -125,3 +125,130 @@ impl BatchBuffer {
         history.get_ordered_data(&mut self.buffer[start..end], board);
     }
 }
+
+use cozy_chess::{Move, Square, Piece, File, Rank};
+
+pub const MOVE_CHANNELS: usize = 73;
+
+// Directional offsets for Queen-like moves
+const DIRECTIONS: [(i8, i8); 8] = [
+    (0, 1), (1, 1), (1, 0), (1, -1),
+    (0, -1), (-1, -1), (-1, 0), (-1, 1)
+];
+
+pub struct MoveEncoder {
+    // lookup[from_sq][to_sq] -> plane_index
+    knight_map: [[Option<usize>; 64]; 64],
+}
+
+impl MoveEncoder {
+    pub fn new() -> Self {
+        let mut knight_map = [[None; 64]; 64];
+        let knight_offsets = [
+            (1, 2), (2, 1), (2, -1), (1, -2),
+            (-1, -2), (-2, -1), (-2, 1), (-1, 2)
+        ];
+
+        for sq in 0..64 {
+            let f = (sq % 8) as i8;
+            let r = (sq / 8) as i8;
+            for (idx, (df, dr)) in knight_offsets.iter().enumerate() {
+                let nf = f + df;
+                let nr = r + dr;
+                if nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
+                    knight_map[sq][(nr * 8 + nf) as usize] = Some(56 + idx);
+                }
+            }
+        }
+        Self { knight_map }
+    }
+
+    pub fn encode(&self, mv: Move) -> [usize; 2] {
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        
+        let from_f = (from % 8) as i8;
+        let from_r = (from / 8) as i8;
+        let to_f = (to % 8) as i8;
+        let to_r = (to / 8) as i8;
+
+        let df = to_f - from_f;
+        let dr = to_r - from_r;
+
+        let plane = if let Some(p) = mv.promotion {
+            // Under-promotions (Knight=0, Bishop=1, Rook=2)
+            // Queen promotions are handled as normal queen moves
+            if p != Piece::Queen {
+                let promo_idx = match p {
+                    Piece::Knight => 0,
+                    Piece::Bishop => 1,
+                    Piece::Rook => 2,
+                    _ => 0,
+                };
+                let dir_idx = (df + 1) as usize; // -1 -> 0, 0 -> 1, 1 -> 2
+                64 + (promo_idx * 3) + dir_idx
+            } else {
+                self.get_queen_plane(df, dr)
+            }
+        } else if let Some(p) = self.knight_map[from][to] {
+            p
+        } else {
+            self.get_queen_plane(df, dr)
+        };
+
+        [from, plane]
+    }
+
+    fn get_queen_plane(&self, df: i8, dr: i8) -> usize {
+        let dist = df.abs().max(dr.abs());
+        let (nf, nr) = (df / dist, dr / dist);
+        
+        let dir_idx = DIRECTIONS.iter().position(|&d| d == (nf, nr)).unwrap();
+        (dir_idx * 7) + (dist as usize - 1)
+    }
+
+    pub fn decode(&self, from: usize, plane: usize) -> (Square, Square, Option<Piece>) {
+        let from_sq = Square::index(from);
+        let from_f = from % 8;
+        let from_r = from / 8;
+
+        if plane < 56 {
+            // Queen moves
+            let dir_idx = plane / 7;
+            let dist = (plane % 7) + 1;
+            let (df, dr) = DIRECTIONS[dir_idx];
+            let to_sq = Square::new(
+                File::index((from_f as i8 + df * dist as i8) as usize),
+                Rank::index((from_r as i8 + dr * dist as i8) as usize)
+            );
+            (from_sq, to_sq, None)
+        } else if plane < 64 {
+            // Knight moves - Reverse lookup
+            let knight_idx = plane - 56;
+            let knight_offsets = [(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)];
+            let (df, dr) = knight_offsets[knight_idx];
+            let to_sq = Square::new(
+                File::index((from_f as i8 + df) as usize),
+                Rank::index((from_r as i8 + dr) as usize)
+            );
+            (from_sq, to_sq, None)
+        } else {
+            // Under-promotions
+            let p_type = (plane - 64) / 3;
+            let dir_idx = (plane - 64) % 3;
+            let df = dir_idx as i8 - 1;
+            let dr = 1; // Always forward for promotion
+            let piece = match p_type {
+                0 => Piece::Knight,
+                1 => Piece::Bishop,
+                2 => Piece::Rook,
+                _ => Piece::Queen
+            };
+            let to_sq = Square::new(
+                File::index((from_f as i8 + df) as usize),
+                Rank::index((from_r as i8 + dr) as usize)
+            );
+            (from_sq, to_sq, Some(piece))
+        }
+    }
+}
