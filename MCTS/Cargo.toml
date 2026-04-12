@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 bytemuck = "1.25.0"
 cozy-chess = "0.3.4"
+crossbeam = "0.8.4"
 zmq = "0.10.0"
