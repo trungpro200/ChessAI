@@ -1,152 +1,120 @@
-use std::collections::HashMap;
-use cozy_chess::PieceMoves;
-pub use cozy_chess::{Board, Move, Color};
+use dashmap::DashMap;
+pub use cozy_chess::*;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::Arc;
 
-const C_PUCT: f64 = 1.4;
+const C_PUCT: f32 = 1.4;
+const V_LOSS: f32 = 1.0;
+const F_SCALE: f32 = 1000.0; // Scale for atomic f32 storage
 
-#[derive(Default)]
 pub struct Node {
-    pub n: HashMap<Move, i32>,   // visit count
-    pub w: HashMap<Move, f64>,   // total value
-    pub q: HashMap<Move, f64>,   // mean value
-    pub p: HashMap<Move, f64>,   // prior (uniform for now)
+    // We use a single map for all move data to keep it cache-local
+    pub moves: DashMap<Move, MoveStats>,
+}
+
+pub struct MoveStats {
+    pub n: AtomicU32,
+    pub w: AtomicI64,      // Total value scaled by F_SCALE
+    pub p: f32,            // Prior
+    pub v_loss: AtomicU32, // Virtual loss count
 }
 
 pub struct Tree {
-    pub tt: HashMap<u64, Node>, // transposition table
-    pub root: u64,
+    pub tt: DashMap<u64, Arc<Node>>,
 }
 
 impl Tree {
-    pub fn new(board: &Board) -> Self {
-        let mut tt = HashMap::new();
-        tt.insert(board.hash(), Node::default());
-
-        Self {
-            tt,
-            root: board.hash(),
-        }
+    pub fn new() -> Self {
+        Self { tt: DashMap::new() }
     }
 
-    /// Run one MCTS simulation
-    pub fn simulate(&mut self, board: &Board) {
-        let mut path: Vec<(u64, Move)> = Vec::new();
-        let mut current: Board = board.clone();
+    /// Primary search function for a worker thread
+    pub fn select_leaf(&self, board: &Board) -> (Vec<(u64, Move)>, Board) {
+        let mut path = Vec::new();
+        let mut current = board.clone();
 
-        // === 1. SELECTION ===
         loop {
-            let hash: u64 = current.hash();
-
-            let node: &mut Node = self.tt.entry(hash).or_default();
-            let mut moves: Vec<Move> = Vec::new();
-
+            let hash = current.hash();
             
-
-            // If leaf (not expanded)
-            if node.n.is_empty() {
-                current.generate_moves(|mv |{
-                    moves.extend(mv);
+            // 1. Expansion: If node doesn't exist, it's a leaf
+            let node: dashmap::mapref::one::RefMut<'_, u64, Arc<Node>> = self.tt.entry(hash).or_insert_with(|| {
+                let mut moves: DashMap<Move, MoveStats> = DashMap::new();
+                current.generate_moves(|mvs| {
+                        for mv in mvs {
+                            moves.insert(mv, MoveStats {
+                            n: AtomicU32::new(0),
+                            w: AtomicI64::new(0),
+                            p: 0.0, // Will be updated by Policy Head
+                            v_loss: AtomicU32::new(0),
+                        });
+                    }
                     false
                 });
+                Arc::new(Node { moves })
+            });
+
+            // 2. Selection
+            let total_n: u32 = node.moves.iter().map(|m| m.n.load(Ordering::Relaxed)).sum();
+            let total_vloss: u32 = node.moves.iter().map(|m| m.v_loss.load(Ordering::Relaxed)).sum();
+            let sqrt_n = ((total_n + total_vloss) as f32).sqrt();
+
+            let best_move = node.moves.iter().max_by(|a, b| {
+                let score_a = self.calculate_puct(a.value(), sqrt_n);
+                let score_b = self.calculate_puct(b.value(), sqrt_n);
+                score_a.partial_cmp(&score_b).unwrap()
+            }).map(|m| *m.key());
+
+            match best_move {
+                Some(mv) => {
+                    // Apply Virtual Loss to discourage other workers
+                    let stats = node.moves.get(&mv).unwrap();
+                    stats.v_loss.fetch_add(1, Ordering::SeqCst);
+                    
+                    path.push((hash, mv));
+                    current.play(mv);
+
+                    // If this move leads to a node we haven't seen, it's our expansion target
+                    if !self.tt.contains_key(&current.hash()) {
+                        return (path, current);
+                    }
+                }
+                None => return (path, current), // Terminal state
             }
+        }
+    }
 
-            // Select best move via PUCT
-            let total_n: f64 = node.n.values().map(|&v| v as f64).sum();
+    fn calculate_puct(&self, stats: &MoveStats, sqrt_n: f32) -> f32 {
+        let n = stats.n.load(Ordering::Relaxed) as f32;
+        let v_loss = stats.v_loss.load(Ordering::Relaxed) as f32;
+        
+        // Q = (W - VLOSS) / (N + VLOSS)
+        let w = (stats.w.load(Ordering::Relaxed) as f32) / F_SCALE;
+        let q = if n + v_loss > 0.0 {
+            (w - (v_loss * V_LOSS)) / (n + v_loss)
+        } else {
+            0.0
+        };
 
-            let mut best_move = None;
-            let mut best_score = f64::NEG_INFINITY;
+        let u = C_PUCT * stats.p * (sqrt_n / (1.0 + n + v_loss));
+        q + u
+    }
 
-            for mv in moves {
-                let n = *node.n.get(mv).unwrap_or(&0) as f64;
-                let q = *node.q.get(mv).unwrap_or(&0.0);
-                let p = *node.p.get(mv).unwrap_or(&0.0);
-
-                let u = C_PUCT * p * (total_n.sqrt() / (1.0 + n));
-                let score = q + u;
-
-                if score > best_score {
-                    best_score = score;
-                    best_move = Some(*mv);
+    pub fn backprop(&self, path: Vec<(u64, Move)>, mut value: f32) {
+        // value is from the perspective of the player who just moved
+        for (hash, mv) in path.into_iter().rev() {
+            if let Some(node) = self.tt.get(&hash) {
+                if let Some(stats) = node.moves.get(&mv) {
+                    // Update stats
+                    stats.n.fetch_add(1, Ordering::SeqCst);
+                    let scaled_v = (value * F_SCALE) as i64;
+                    stats.w.fetch_add(scaled_v, Ordering::SeqCst);
+                    
+                    // Remove Virtual Loss
+                    stats.v_loss.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-
-            let mv = best_move.unwrap();
-            path.push((hash, mv));
-            current.play(mv);
-        }
-
-        // === 2. SIMULATION ===
-        let value = self.rollout(&current);
-
-        // === 3. BACKPROP ===
-        self.backprop(path, value, board.side_to_move());
-    }
-
-    fn expand(&mut self, node: &mut Node, moves: &[Move]) {
-        let prior = 1.0 / moves.len() as f64;
-
-        for &mv in moves {
-            node.n.insert(mv, 0);
-            node.w.insert(mv, 0.0);
-            node.q.insert(mv, 0.0);
-            node.p.insert(mv, prior); // uniform prior
-        }
-    }
-
-    fn rollout(&self, board: &Board) -> f64 {
-        // VERY basic random rollout
-        let mut b = board.clone();
-
-        for _ in 0..100 {
-            if let Some(result) = b.status() {
-                return match result {
-                    cozy_chess::GameStatus::Won => 1.0,
-                    cozy_chess::GameStatus::Drawn => 0.0,
-                    cozy_chess::GameStatus::Ongoing => continue,
-                };
-            }
-
-            let moves: Vec<Move> = b.generate_moves().collect();
-            if moves.is_empty() {
-                return 0.0;
-            }
-
-            let mv = moves[rand::random::<usize>() % moves.len()];
-            b.play(mv);
-        }
-
-        0.0
-    }
-
-    fn backprop(
-        &mut self,
-        path: Vec<(u64, Move)>,
-        mut value: f64,
-        root_player: Color,
-    ) {
-        for (hash, mv) in path.into_iter().rev() {
-            let node = self.tt.get_mut(&hash).unwrap();
-
-            let n = node.n.entry(mv).or_insert(0);
-            let w = node.w.entry(mv).or_insert(0.0);
-            let q = node.q.entry(mv).or_insert(0.0);
-
-            *n += 1;
-            *w += value;
-            *q = *w / *n as f64;
-
-            // Flip perspective each step
+            // Flip value for previous player
             value = -value;
         }
-    }
-
-    /// Get best move after simulations
-    pub fn best_move(&self, board: &Board) -> Option<Move> {
-        let node = self.tt.get(&board.hash())?;
-
-        node.n
-            .iter()
-            .max_by_key(|(_, &n)| n)
-            .map(|(&mv, _)| mv)
     }
 }
