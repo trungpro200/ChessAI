@@ -1,4 +1,6 @@
 bulletchess==0.4.0
+python-chess==1.999
+tqdm>=4.66.0
 contourpy==1.3.3
 cycler==0.12.1
 filelock==3.20.0
