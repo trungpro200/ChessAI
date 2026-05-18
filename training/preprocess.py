@@ -72,7 +72,7 @@ class ShardWriter:
 
 
 def _iter_game_chunks(
-    pgn_path: Path, max_games: int | None, chunk_size: int = 1000
+    pgn_path: Path, max_games: int | None, chunk_size: int = 2000
 ):
     chunk: list[tuple] = []
     with open(pgn_path, encoding="utf-8") as f:
@@ -101,10 +101,10 @@ class PreprocessTask:
 def preprocess(
     pgn_path: Path,
     out_dir: Path,
-    shard_size: int = 80_000,
+    shard_size: int = 320_000,
     min_plies: int = 8,
     val_fraction: float = 0.01,
-    workers: int = 8,
+    workers: int = 4,
     eval_cp_scale: float = 4.0,
     max_games: int | None = None,
 ) -> None:
