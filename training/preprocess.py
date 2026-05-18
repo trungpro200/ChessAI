@@ -13,6 +13,7 @@ from tqdm import tqdm
 from training.config import TrainConfig
 from training.encode_game import EncodedSample, encode_game
 from training.pgn_parser import game_split_key, is_val_split, stream_games
+from chess.pgn import Game
 
 
 def _samples_to_arrays(samples: list[EncodedSample]) -> dict[str, np.ndarray]:
@@ -27,7 +28,7 @@ def _samples_to_arrays(samples: list[EncodedSample]) -> dict[str, np.ndarray]:
 
 
 def _process_game(
-    game,
+    game: Game,
     game_index: int,
     val_fraction: float,
     eval_cp_scale: float,
@@ -54,8 +55,10 @@ class ShardWriter:
             return
         self.buffer.extend(samples)
         while len(self.buffer) >= self.shard_size:
+            # Pass only the slice needed
             self._write_chunk(self.buffer[: self.shard_size])
-            self.buffer = self.buffer[self.shard_size :]
+            # Delete the processed items in-place to avoid copying
+            del self.buffer[: self.shard_size]
 
     def flush(self) -> None:
         if self.buffer:
@@ -72,7 +75,7 @@ class ShardWriter:
 
 
 def _iter_game_chunks(
-    pgn_path: Path, max_games: int | None, chunk_size: int = 2000
+    pgn_path: Path, max_games: int | None, chunk_size: int = 1000
 ):
     chunk: list[tuple] = []
     with open(pgn_path, encoding="utf-8") as f:
@@ -101,7 +104,7 @@ class PreprocessTask:
 def preprocess(
     pgn_path: Path,
     out_dir: Path,
-    shard_size: int = 320_000,
+    shard_size: int = 80_000,
     min_plies: int = 8,
     val_fraction: float = 0.01,
     workers: int = 4,

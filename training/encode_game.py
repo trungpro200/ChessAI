@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import bulletchess as bc
 import chess as pychess
 import numpy as np
+import chess.pgn as pgn
 
 from Model.board_encoder import State
 from Model.move_encoder import encode_move
@@ -29,7 +30,7 @@ def _pychess_move_to_bullet(move: pychess.Move) -> bc.Move:
 
 
 def encode_game(
-    game: pychess.pgn.Game,
+    game: pgn.Game,
     eval_cp_scale: float = 4.0,
     min_plies: int = 8,
 ) -> list[EncodedSample]:
