@@ -86,6 +86,17 @@ def _iter_game_chunks(
         if chunk:
             yield chunk
 
+class PreprocessTask:
+    def __init__(self, val_fraction: float, eval_cp_scale: float, min_plies: int):
+        self.val_fraction = val_fraction
+        self.eval_cp_scale = eval_cp_scale
+        self.min_plies = min_plies
+
+    def __call__(self, item: tuple) -> tuple[str, list[EncodedSample]]:
+        game, game_index = item
+        return _process_game(
+            game, game_index, self.val_fraction, self.eval_cp_scale, self.min_plies
+        )
 
 def preprocess(
     pgn_path: Path,
@@ -105,11 +116,9 @@ def preprocess(
     games_skipped = 0
     games_processed = 0
 
-    def _task(item: tuple) -> tuple[str, list[EncodedSample]]:
-        game, game_index = item
-        return _process_game(
-            game, game_index, val_fraction, eval_cp_scale, min_plies
-        )
+    # Instantiate the picklable task class here
+    _task = PreprocessTask(val_fraction, eval_cp_scale, min_plies)
+    
 
     chunks = _iter_game_chunks(pgn_path, max_games)
     pool: mp.pool.Pool | None = None
