@@ -9,7 +9,7 @@ class TrainConfig:
     shard_dir: Path = Path("data/shards")
     checkpoint_dir: Path = Path("checkpoints")
 
-    shard_size: int = 320_000
+    shard_size: int = 80_000
     min_plies: int = 8
     val_fraction: float = 0.01
 
