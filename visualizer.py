@@ -1,8 +1,10 @@
-import torchshow as ts 
 import torch
+from Model.chess_model import ChessModel, verify_model, TARGET_PARAMS, MAX_PARAMS
 
-tens: torch.Tensor = torch.load("debug.ts")
-
-views = [tens[0][:, x].view(8,8) for x in range(12, 36)]
-print(views[-1])
-ts.show(views,nrows = 4, ncols = 4, mode="grayscale", auto_permute=False)
+md = ChessModel()
+info = verify_model(md)
+print(f"Total parameters: {info['params']:,}")
+print(f"Budget: {TARGET_PARAMS:,} (legacy) .. {MAX_PARAMS:,} (max)")
+print(f"Policy shape: {info['policy_shape']}, Value shape: {info['value_shape']}")
+assert info["within_budget"], f"Parameter count {info['params']} exceeds {MAX_PARAMS}"
+print(md)

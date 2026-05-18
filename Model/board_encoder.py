@@ -7,6 +7,8 @@ SHIFTS = torch.arange(64, dtype=torch.int64)
 PIECES = [chess.Piece(chess.WHITE, x) for x in chess.PIECE_TYPES] + [chess.Piece(chess.BLACK, x) for x in chess.PIECE_TYPES] 
 PIECES_INT_DICT: dict[chess.Piece] = dict([reversed(x) for x in enumerate(PIECES)])  # type: ignore
 
+HISTORY_LEN = 8  # must match MCTS/src/encoder.rs
+
 
 class State:
     def __init__(self, board: chess.Board, init_board = True) -> None:
@@ -129,13 +131,22 @@ class State:
         self.move_stack.pop()
     
     @property
-    def tokens(self): # Reorder to feed into NN
+    def tokens(self):
+        """[1, 64, 103] — 8 history frames (newest first) + 7 meta planes per square."""
         self.update_metadata()
-        
-        size = min(len(self.move_stack), 4)
-        histories = [self.pos_cache[self.move_stack[i]] for i in range(size)]
-        
-        if size < 4:
-            histories += [self.history_planes]*(4-size)
-        
-        return torch.cat((*histories, self.meta_planes), dim=1).unsqueeze(0)
+
+        frames: list[torch.Tensor] = []
+        for k in range(HISTORY_LEN):
+            if k == 0:
+                h = self.board.__hash__()
+            elif len(self.move_stack) >= k + 1:
+                h = self.move_stack[-(k + 1)]
+            else:
+                h = None
+
+            if h is not None and h in self.pos_cache:
+                frames.append(self.pos_cache[h])
+            else:
+                frames.append(self.history_planes)
+
+        return torch.cat((*frames, self.meta_planes), dim=1).unsqueeze(0)
