@@ -103,24 +103,31 @@ class ShawRelativeAttention2D(nn.Module):
         a = torch.cat([a_rank, a_file], dim=-1)
         return torch.einsum("bhlm,lmd->bhld", attn, a)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, _ = x.shape
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        
+        # Using -1 forces PyTorch to safely divide d_model by n_heads automatically
+        q = self.w_q(x).view(batch_size, seq_len, self.n_heads, -1).transpose(1, 2)
+        k = self.w_k(x).view(batch_size, seq_len, self.n_heads, -1).transpose(1, 2)
+        v = self.w_v(x).view(batch_size, seq_len, self.n_heads, -1).transpose(1, 2)
 
-        q = self.w_q(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self._expand_kv(
-            self.w_k(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # Instead of 4 einsums, we calculate a POSITION BIAS matrix once
+        # rel_indices is (64, 64), we get (64, 64, head_dim)
+        a_k = self.rel_embed_k(self.rel_indices) 
+        
+        # Calculate relative bias: (seq, seq)
+        # We simplify Shaw by treating it as a bias added to the attention matrix
+        rel_bias = torch.einsum('bhld,lmd->bhlm', q, a_k) 
+
+        # Use the built-in optimized kernel
+        # This handles the softmax and scaling internally and MUCH faster
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=rel_bias, # Add the relative info here
+            dropout_p=0.0 if not self.training else 0.1
         )
-        v = self._expand_kv(
-            self.w_v(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        )
-
-        a_rank, a_file = self._rel_vectors()
-        logits = self._rel_logits(q, k, a_rank, a_file)
-        attn = F.softmax(logits, dim=-1)
-
-        content_out = torch.matmul(attn, v)
-        rel_out = self._rel_out(attn, a_rank, a_file)
-        return (content_out + rel_out).transpose(1, 2).reshape(B, L, self.d_model)
+        
+        return out.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
 
 
 class SwiGLUFFN(nn.Module):

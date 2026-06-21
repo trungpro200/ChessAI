@@ -1,6 +1,7 @@
 """Supervised training. Run: python -m training.train --data data"""
 
 from __future__ import annotations
+from tqdm import tqdm
 
 import argparse
 import random
@@ -42,24 +43,22 @@ def _run_epoch(
     totals = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "eval_loss": 0.0, "policy_acc": 0.0}
     n_batches = 0
 
-    for batch in loader:
+    # Wrap the loader with tqdm
+    desc = "Training" if train else "Evaluating"
+    pbar = tqdm(loader, desc=desc, leave=False, disable=False)
+
+    for batch in pbar:
+        
         batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        
         if train:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train):
-            if scaler is not None and train:
-                with torch.amp.autocast("cuda"):
-                    policy, value = model(batch["features"])
-                    loss, metrics = compute_loss(
-                        policy,
-                        value,
-                        batch,
-                        w_policy=cfg.w_policy,
-                        w_value=cfg.w_value,
-                        w_eval=cfg.w_eval,
-                    )
-            else:
+            # Combined the autocast logic for readability
+            context = torch.amp.autocast("cuda") if (scaler is not None and train) else torch.inference_mode() 
+            
+            with context:
                 policy, value = model(batch["features"])
                 loss, metrics = compute_loss(
                     policy,
@@ -82,9 +81,16 @@ def _run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
                 optimizer.step()
 
+        # Update totals and progress bar
+        n_batches += 1
         for k in totals:
             totals[k] += metrics.get(k, 0.0)
-        n_batches += 1
+        
+        # Display running average in the progress bar
+        pbar.set_postfix({
+            "loss": f"{totals['loss']/n_batches:.4f}",
+            "p_acc": f"{totals['policy_acc']/n_batches:.2%}"
+        })
 
     if n_batches == 0:
         return totals
@@ -102,7 +108,6 @@ def train(cfg: TrainConfig, resume: Path | None = None) -> None:
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        shuffle=True,
         num_workers=cfg.num_workers,
         collate_fn=_collate,
         pin_memory=device == "cuda",
@@ -110,7 +115,6 @@ def train(cfg: TrainConfig, resume: Path | None = None) -> None:
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
-        shuffle=False,
         num_workers=cfg.num_workers,
         collate_fn=_collate,
         pin_memory=device == "cuda",

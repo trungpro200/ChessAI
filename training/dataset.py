@@ -2,53 +2,80 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 
 
-class ShardDataset(Dataset):
-    """Index over npz shards; loads one shard at a time to limit RAM."""
+import random
+import torch
+import numpy as np
+from torch.utils.data import IterableDataset, DataLoader
+from pathlib import Path
 
-    def __init__(self, shard_dir: Path, shard_names: list[str]) -> None:
+class ShardDataset(IterableDataset):
+    def __init__(self, shard_dir: Path, shard_names: list[str]):
+        super().__init__()
         self.shard_dir = Path(shard_dir)
         self.shard_paths = [self.shard_dir / name for name in shard_names]
-        self.cumsum: list[int] = [0]
-        for path in self.shard_paths:
+        
+        # Hardcode or estimate this so __init__ doesn't touch the disk
+        # 300 shards * 80,000 positions
+        self.total_positions = len(self.shard_paths) * 80000 
+
+    def __len__(self):
+        return self.total_positions
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        
+        # 1. Split shard list so workers never touch the same file
+        if worker_info is None:
+            my_shards = self.shard_paths
+        else:
+            my_shards = [s for i, s in enumerate(self.shard_paths) 
+                         if i % worker_info.num_workers == worker_info.id]
+        
+        random.shuffle(my_shards)
+
+        for path in my_shards:
+            # 2. LOAD ONE SHARD
+            # We use 'with' so the file handle and memory are released after the shard is exhausted
             with np.load(path) as data:
-                n = len(data["z"])
-            self.cumsum.append(self.cumsum[-1] + n)
+                # We pull them into local variables. 
+                # This is the ONLY time RAM should increase.
+                features = data["features"]
+                from_sq = data["from_sq"]
+                plane = data["plane"]
+                z = data["z"]
+                z_eval = data["z_eval"]
+                has_eval = data["has_eval"]
+                
+                n = len(z)
+                indices = np.arange(n)
+                np.random.shuffle(indices)
 
-        self._cache_idx = -1
-        self._cache: dict[str, np.ndarray] | None = None
+                # 3. USE ALL DATA IN SHARD
+                for idx in indices:
+                    yield {
+                        "features": torch.from_numpy(features[idx].astype(np.float32)),
+                        "from_sq": int(from_sq[idx]),
+                        "plane": int(plane[idx]),
+                        "z": torch.tensor(z[idx], dtype=torch.float32),
+                        "z_eval": torch.tensor(z_eval[idx], dtype=torch.float32),
+                        "has_eval": bool(has_eval[idx]),
+                    }
+            
+            # 4. SHARD IS DROPPED HERE
+            # Once we exit the 'with' block, the local variables are eligible for Garbage Collection.
+            # RAM should drop back down before the next 'path' in 'my_shards' is loaded.
 
-    def __len__(self) -> int:
-        return self.cumsum[-1]
-
-    def _locate(self, index: int) -> tuple[int, int]:
-        lo, hi = 0, len(self.shard_paths) - 1
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if self.cumsum[mid] <= index:
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo, index - self.cumsum[lo]
-
-    def _get_shard(self, shard_idx: int) -> dict[str, np.ndarray]:
-        if shard_idx != self._cache_idx:
-            self._cache = dict(np.load(self.shard_paths[shard_idx]))
-            self._cache_idx = shard_idx
-        assert self._cache is not None
-        return self._cache
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        shard_idx, local = self._locate(index)
-        shard = self._get_shard(shard_idx)
-        features = torch.from_numpy(shard["features"][local].astype(np.float32))
+    def _get_sample(self, shard, local):
+        # Single-slice access is fast with mmap
         return {
-            "features": features,
+            "features": torch.from_numpy(shard["features"][local].astype(np.float32)),
             "from_sq": int(shard["from_sq"][local]),
             "plane": int(shard["plane"][local]),
             "z": torch.tensor(shard["z"][local], dtype=torch.float32),

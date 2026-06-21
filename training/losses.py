@@ -12,7 +12,7 @@ def policy_loss(
     """Cross-entropy on (from_sq, plane) indices. policy_logits: [B, 64, 73]."""
     b = policy_logits.shape[0]
     idx = from_sq * PLANES + plane
-    flat = policy_logits.view(b, -1)
+    flat = policy_logits.flatten(1, -1)
     return F.cross_entropy(flat, idx)
 
 
@@ -22,7 +22,7 @@ def policy_accuracy(
     plane: torch.Tensor,
 ) -> float:
     b = policy_logits.shape[0]
-    flat_idx = policy_logits.view(b, -1).argmax(dim=-1)
+    flat_idx = policy_logits.flatten(1, -1).argmax(dim=-1)
     target = from_sq * PLANES + plane
     return (flat_idx == target).float().mean().item()
 

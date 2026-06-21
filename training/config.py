@@ -24,8 +24,8 @@ class TrainConfig:
     w_eval: float = 0.25
     eval_cp_scale: float = 4.0
 
-    num_workers: int = 0
-    preprocess_workers: int = 8
+    num_workers: int = 0 # Broken, do not use
+    preprocess_workers: int = 4
     amp: bool = True
 
     log_every: int = 100

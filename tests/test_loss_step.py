@@ -45,3 +45,6 @@ def test_shard_dataset_roundtrip():
         ds = ShardDataset(Path(tmp), [path.name])
         item = ds[0]
         assert item["features"].shape == (64, 103)
+
+if __name__ == "__main__":
+    test_loss_backward()

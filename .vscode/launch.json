@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Train Module",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "training.train",
+            "args": [
+                "--data", "data",
+                "--epochs", "1",
+                "--batch-size", "512"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}
