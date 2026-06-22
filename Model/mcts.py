@@ -3,408 +3,526 @@ import numpy as np
 import bulletchess as chess
 from .board_encoder import State
 from .move_encoder import encode_move, decode_move
-from copy import deepcopy
 from .chess_model import ChessModel
 from collections import deque
-import torch, random, gc
+import torch
+import random
+import threading
+import queue
+from copy import deepcopy
+from .device import device
 
 
-CPUCT = 1.41
-GLOBAL_BUFFER = deque()
-TERMINAL_STATES = [chess.THREEFOLD_REPETITION, chess.FIFTY_MOVE_TIMEOUT, chess.STALEMATE, chess.CHECKMATE]
+# ──────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────
+CPUCT        = 1.41
+GLOBAL_BUFFER: deque = deque()
+TERMINAL_STATES = [
+    chess.THREEFOLD_REPETITION,
+    chess.FIFTY_MOVE_TIMEOUT,
+    chess.STALEMATE,
+    chess.CHECKMATE,
+]
 VIRTUAL_LOSS = 1
 
 PIECE_VALUES = {
-    chess.PAWN: 100,   # pawn
-    chess.KNIGHT: 320,   # knight
-    chess.BISHOP: 330,   # bishop
-    chess.ROOK: 500,   # rook
-    chess.QUEEN: 900,   # queen
-    chess.KING: 2000  # king (để cho đủ)
+    chess.PAWN:   100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 330,
+    chess.ROOK:   500,
+    chess.QUEEN:  900,
+    chess.KING:  2000,
 }
 
-def mvv_lva_score(board: chess.Board, move: chess.Move):
-    # No capture → lowest priority
-    victim_piece: chess.Piece = board[move.destination] #type: ignore
-    attacker_piece: chess.Piece = board[move.origin] #type: ignore
-    
-    score = 0
-    
-    if is_enpassant(board, move): # is_capture() won't detect enpassant so we do this :/
-        victim_value = PIECE_VALUES[chess.PAWN]
-        attacker_value = PIECE_VALUES[attacker_piece.piece_type]
-        score = victim_value * 10 - attacker_value
-    elif move.is_capture(board):
-        victim_value = PIECE_VALUES[victim_piece.piece_type]
-        attacker_value = PIECE_VALUES[attacker_piece.piece_type]
-        score = victim_value * 10 - attacker_value
+# Sentinel pushed by each worker into the leaf_queue when it finishes
+_WORKER_DONE = object()
 
-    # --- checks ---
+
+# ──────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────
+def is_enpassant(board: chess.Board, move: chess.Move) -> bool:
+    piece = board[move.origin]
+    if piece is None or piece.piece_type != chess.PAWN:
+        return False
+    return move.destination == board.en_passant_square
+
+
+def mvv_lva_score(board: chess.Board, move: chess.Move) -> int:
+    score = 0
+    attacker: chess.Piece = board[move.origin]  # type: ignore
+
+    if is_enpassant(board, move):
+        score = PIECE_VALUES[chess.PAWN] * 10 - PIECE_VALUES[attacker.piece_type]
+    elif move.is_capture(board):
+        victim: chess.Piece = board[move.destination]  # type: ignore
+        score = PIECE_VALUES[victim.piece_type] * 10 - PIECE_VALUES[attacker.piece_type]
+
     board.apply(move)
     if board in chess.CHECK:
         score += 50
     board.undo()
-    # --- castling ---
+
     if move.is_castling(board):
         score += 30
 
-    # MVV-LVA: maximize victim, minimize attacker
     return score
 
-def is_enpassant(board: chess.Board, move: chess.Move):
-    piece = board[move.origin]
-    if piece is None:
-        return False
-    if piece.piece_type != chess.PAWN:
-        return False
-    if move.destination == board.en_passant_square:
-        return True
-    
-    return False
-
-def debug_path(path: deque[tuple], board: chess.Board):
-    a = []
-    for hash, item in reversed(path):
-        board.undo()
-        a.append(decode_move(board, item))
-    
-    print(list(reversed(a)))
 
 def is_terminal(board: chess.Board):
+    """
+    Returns:
+        None  → game still in progress
+        0     → draw
+        +1    → White wins  (from White's perspective)
+        -1    → Black wins
+    """
     if board.halfmove_clock >= 24:
         return 0
-    
+
     for state in TERMINAL_STATES:
         if board in state:
             if state == chess.CHECKMATE:
-                return int(board.turn != chess.WHITE)*2 - 1
+                return int(board.turn != chess.WHITE) * 2 - 1
+            return 0
+
     return None
 
 
-
+# ──────────────────────────────────────────────────────────────────
+# Transposition-table node
+# ──────────────────────────────────────────────────────────────────
 class Node:
-    def __init__(self, policy: dict[tuple, float]):
-        self.P = policy        # prior probabilities (dict: move -> prob)
-        
-        # dicts: move -> value
-        self.N: dict[tuple, int] = {}            # visit count per move
-        self.W: dict[tuple, float] = {}            # total value per move
-        self.Q: dict[tuple, float] = {}            # mean value per move
-        
-        self.is_terminal:dict[tuple, bool] = {} # move -> terminal state
-        self.total_visit = 0
-        
+    __slots__ = ("P", "N", "W", "Q", "is_terminal", "total_visit", "matdiff")
+
+    def __init__(self, policy: dict):
+        self.P: dict[tuple, float]      = policy
+        self.N: dict[tuple, int]        = {}
+        self.W: dict[tuple, float]      = {}
+        self.Q: dict[tuple, float]      = {}
+        self.is_terminal: dict[tuple, bool] = {}
+        self.total_visit: int           = 0
         self.matdiff: dict[tuple, float] = {}
 
-class SelfPlay:
-    def __init__(self, model: ChessModel, num_simulations=50, temperature=1.0, batch_size=64, late_mul=2, latethresh=25):
-        self.model = model
-        self.num_simulations = num_simulations
-        self.temperature = temperature
-        self.batch_size = batch_size
-        
-        self.latethresh = latethresh
-        self.late_mul = late_mul
 
-        self.TT: dict[int, Node] = {}   # zobrist -> Node
+# ──────────────────────────────────────────────────────────────────
+# SelfPlay  —  Multi-threaded MCTS with batched GPU inference
+# ──────────────────────────────────────────────────────────────────
+#
+# Architecture
+# ────────────
+# • N worker threads each hold their own Board + move_stack + meta_planes copy
+#   and walk the tree independently.  pos_cache is intentionally SHARED so that
+#   incremental board encodings computed by one worker are visible to all others.
+#
+# • When a worker reaches an un-expanded leaf it:
+#     1. Expands the node (under _tt_lock, double-checked).
+#     2. Applies virtual loss for every node along the path (under _tt_lock).
+#     3. Pushes  (tokens_tensor, path_snapshot, turn_value)  onto leaf_queue.
+#     4. Unwinds back to root and starts the next simulation.
+#
+# • The main thread drains leaf_queue in chunks of `batch_size`, runs a single
+#   GPU forward pass, then backpropagates all results (undoing virtual loss).
+#
+# • The TT (transposition table) is protected by a single RLock.
+#   select_move reads N/Q/P without holding the lock (stale reads are harmless
+#   in UCB — they never corrupt state).  Only _expand and backprop hold the lock.
+#
+class SelfPlay:
+    def __init__(
+        self,
+        model: ChessModel,
+        num_simulations: int = 50,
+        temperature: float   = 1.0,
+        batch_size: int      = 64,
+        late_mul: int        = 2,
+        latethresh: int      = 25,
+        num_workers: int     = 4,
+    ):
+        self.model           = model
+        self.num_simulations = num_simulations
+        self.temperature     = temperature
+        self.batch_size      = batch_size
+        self.late_mul        = late_mul
+        self.latethresh      = latethresh
+        self.num_workers     = num_workers
+
+        self.TT: dict[int, Node] = {}
+        self._tt_lock = threading.RLock()   # RLock: re-entrant so _expand can nest
+
         self.step = 0
         self.model.eval()
 
-    def get_num_sim(self):
-        if self.step <= self.latethresh:
-            num_sim = self.num_simulations
-        else:
-            num_sim = self.num_simulations*self.late_mul*self.late_mul # Increase search depth
-        return num_sim
-    
-    def get_batchsize(self):
-        if self.step <= self.latethresh:
-            batch_size = self.batch_size
-        else:
-            batch_size = int(self.batch_size/self.late_mul) # Lower search width
-        
-        return batch_size
-    
-    def get_cpuct(self):
-        if self.step <= self.latethresh:
-            c_puct = 2.5
-        else:
-            c_puct = CPUCT # Do more accurate moves
-        
-        return c_puct
-    
-    # =========================
-    # PUBLIC ENTRY POINT
-    # =========================
+    # ── Adaptive hyper-parameters ──────────────────────────────────
+    def _is_late(self) -> bool:
+        return self.step > self.latethresh
+
+    def get_num_sim(self) -> int:
+        mul = self.late_mul * self.late_mul if self._is_late() else 1
+        return self.num_simulations * mul
+
+    def get_batchsize(self) -> int:
+        div = self.late_mul if self._is_late() else 1
+        return max(1, self.batch_size // div)
+
+    def get_cpuct(self) -> float:
+        return CPUCT if self._is_late() else 2.5
+
+    # ── Public entry point ─────────────────────────────────────────
     def play_game(self, state: State):
         game_data = []
-        self.step = 0
+        self.step  = 0
 
-        while is_terminal(state.board) is None: 
+        while is_terminal(state.board) is None:
             zhash = state.board.__hash__()
 
-            # run MCTS
             self.run_mcts(state)
 
-            # get improved policy
-            pi = self.get_policy(zhash)
-
-            # store training sample
+            pi   = self.get_policy(zhash)
             game_data.append((state.tokens, pi))
 
-            # sample move
             move = self.sample_move(pi)
-
-            # apply move
-            san = decode_move(state.board, move).san(state.board) #type: ignore
+            san  = decode_move(state.board, move).san(state.board)  # type: ignore
             state.make_move(move)
-            # print(move, self.TT[zhash].N[move]) 
+
             print(san, self.TT[zhash].matdiff.get(move, 0))
-            print(state.board.pretty()) # Debug line
-            
+            print(state.board.pretty())
+
             self.step += 1
 
-        # game finished → assign values
-        outcome = is_terminal(state.board)  # +1 / 0 / -1 from white perspective as always
-        # print(outcome)
-
+        outcome = is_terminal(state.board)
         return self.assign_values(game_data, outcome, GLOBAL_BUFFER)
 
-    # =========================
-    # MCTS
-    # =========================
+    # ── MCTS orchestrator ──────────────────────────────────────────
     def run_mcts(self, root_state: State):
         root_hash = root_state.board.__hash__()
-        
-        if self.TT.get(root_hash) is None: # Expand root first
-            policies = {}
+        self._ensure_root_expanded(root_state, root_hash)
+
+        target_visits = self.get_num_sim() * self.get_batchsize()
+        leaf_queue: queue.Queue = queue.Queue()
+
+        # Spawn workers — each gets its own board copy but shares pos_cache
+        workers = []
+        for _ in range(self.num_workers):
+            worker_state = self._make_worker_state(root_state)
+            t = threading.Thread(
+                target=self._worker_loop,
+                args=(worker_state, root_hash, target_visits, leaf_queue),
+                daemon=True,
+            )
+            t.start()
+            workers.append(t)
+
+        # Main thread: drain queue → GPU inference → backprop
+        batch_size  = self.get_batchsize()
+        done_count  = 0
+        pending: list[tuple] = []
+
+        while done_count < self.num_workers:
+            try:
+                item = leaf_queue.get(timeout=0.05)
+            except queue.Empty:
+                if pending:
+                    self._infer_and_backprop(pending, root_state)
+                    pending.clear()
+                continue
+
+            if item is _WORKER_DONE:
+                done_count += 1
+                if pending:
+                    self._infer_and_backprop(pending, root_state)
+                    pending.clear()
+                continue
+
+            pending.append(item)  # type: ignore
+            if len(pending) >= batch_size:
+                self._infer_and_backprop(pending, root_state)
+                pending.clear()
+
+        if pending:
+            self._infer_and_backprop(pending, root_state)
+
+        for t in workers:
+            t.join()
+
+    # ── Worker state construction ──────────────────────────────────
+    def _make_worker_state(self, root_state: State) -> State:
+        """
+        Create a worker-local State that is safe to mutate independently.
+
+        Sharing rules:
+          board          — deepcopy (workers traverse different branches)
+          move_stack     — fresh empty deque (each worker tracks its own path)
+          meta_planes    — clone (update_metadata writes in-place; must be isolated)
+          history_planes — shared read-only (zero tensor, never mutated after init)
+          pos_cache      — SHARED intentionally (incremental encodings benefit all
+                           workers; concurrent writes are idempotent under the GIL)
+        """
+        ws = State.__new__(State)
+        ws.board          = root_state.board.copy()
+        ws.move_stack     = deque()
+        ws.meta_planes    = root_state.meta_planes.clone()
+        ws.history_planes = root_state.history_planes   # read-only zero tensor
+        ws.pos_cache      = root_state.pos_cache        # shared, see docstring
+        return ws
+
+    # ── Worker thread body ─────────────────────────────────────────
+    def _worker_loop(
+        self,
+        state: State,
+        root_hash: int,
+        target_visits: int,
+        out: queue.Queue,
+    ):
+        """
+        Repeatedly simulate from root until the root node has enough visits.
+        Leaf states are pushed onto `out` for the main thread's GPU batch.
+        """
+        try:
+            root_node = self.TT[root_hash]
+
+            while root_node.total_visit < target_visits:
+                path: deque[tuple] = deque()
+                zhash = root_hash
+
+                while True:
+                    # ── Unexpanded leaf? ───────────────────────────
+                    with self._tt_lock:
+                        already_in_tt = zhash in self.TT
+
+                    if not already_in_tt:
+                        self._expand(state, zhash)
+
+                        # Apply virtual loss along path before other workers see it
+                        with self._tt_lock:
+                            self._backpropagate_locked(
+                                path, value=0,
+                                board=state.board,
+                                increase_visit=False,
+                                v_loss=VIRTUAL_LOSS,
+                            )
+
+                        turn_value = int(not state.board.turn == chess.WHITE) * 2 - 1
+
+                        # Push leaf for GPU inference (only non-root leaves)
+                        if zhash != root_hash:
+                            out.put((state.tokens.clone(), list(path), turn_value))
+
+                        # Unwind back to root
+                        for _ in path:
+                            state.unmake_move()
+
+                        break
+
+                    # ── Selection ──────────────────────────────────
+                    node = self.TT[zhash]
+                    move = self._select_move(node, state.board)
+
+                    path.append((zhash, move))
+                    state.make_move(move)
+
+                    # ── Terminal check ─────────────────────────────
+                    terminal = is_terminal(state.board)
+                    if terminal is not None:
+                        with self._tt_lock:
+                            node.is_terminal[move] = True
+                            self._backpropagate_locked(
+                                path, value=terminal,
+                                board=state.board,
+                                increase_visit=True,
+                            )
+                        for _ in path:
+                            state.unmake_move()
+                        break
+
+                    zhash = state.board.__hash__()
+
+        finally:
+            out.put(_WORKER_DONE)
+
+    # ── GPU inference + backpropagation ───────────────────────────
+    def _infer_and_backprop(self, pending: list, root_state: State):
+        """
+        Batched forward pass → write policy priors → undo virtual loss.
+        `pending` is a list of  (tokens_tensor, path_list, turn_value).
+        """
+        batch = torch.cat([item[0] for item in pending], dim=0).to(device)
+
+        with torch.no_grad():
+            p_batch, v_batch = self.model(batch)
+
+        with self._tt_lock:
+            for i, (_, path_list, turn_value) in enumerate(pending):
+                if not path_list:
+                    continue
+
+                leaf_hash, _ = path_list[-1]
+                if leaf_hash not in self.TT:
+                    continue
+
+                leaf_node = self.TT[leaf_hash]
+                policies  = p_batch[i]
+                value     = v_batch[i].item()
+
+                # Write network policy priors into the leaf node
+                for move in leaf_node.P:
+                    leaf_node.P[move] = policies[move].item()
+
+                # Undo virtual loss and credit real value in one pass
+                self._backpropagate_locked(
+                    deque(path_list),
+                    value=value,
+                    board=root_state.board,
+                    increase_visit=True,
+                    v_loss=-VIRTUAL_LOSS,
+                    demand_flip=turn_value,
+                )
+
+    # ── Node expansion ─────────────────────────────────────────────
+    def _expand(self, state: State, zhash: int) -> Node:
+        """
+        Create a new Node for `zhash` and register it in TT.
+        Double-checked locking: only the first worker to arrive writes the node.
+        """
+        with self._tt_lock:
+            if zhash in self.TT:        # another worker expanded it first
+                return self.TT[zhash]
+
+            board      = state.board
+            is_white   = board.turn == chess.WHITE
+            turn_value = 2 * int(is_white) - 1
+
+            policies: dict[tuple, float] = {}
             node = Node(policies)
-            for lmove in sorted(root_state.board.legal_moves(), key=lambda x: mvv_lva_score(root_state.board, x), reverse=True):
-                e = encode_move(lmove, root_state.board)
-                policies[e] = 0
-                node.N[e] = 0
-                node.W[e] = 0
 
-            self.TT[root_hash] = node
-        
-        
-        root_node = self.TT[root_hash]
-        
-        num_sim = self.get_num_sim()
-        bs = self.get_batchsize()
+            for lmove in sorted(
+                board.legal_moves(),
+                key=lambda m: mvv_lva_score(board, m),
+                reverse=True,
+            ):
+                e = encode_move(lmove, board)
+                policies[e] = 0.0
+                node.N[e]   = 0
+                node.W[e]   = 0.0
 
-        while root_node.total_visit < num_sim*bs:
+                if is_enpassant(board, lmove):
+                    node.matdiff[e] = turn_value * 1.0
+                elif lmove.is_capture(board):
+                    captured: chess.Piece = board[lmove.destination]  # type: ignore
+                    node.matdiff[e] = turn_value * PIECE_VALUES[captured.piece_type] / 100
 
-            paths: deque[deque[tuple]] = deque() # hash, move
-            batch = self.simulate(root_state, paths)
-            if batch != []:
-                with torch.no_grad():
-                    p, v = self.model(batch)
-                p: torch.Tensor 
-                v: torch.Tensor
-                # print(paths)
-                for i, path in enumerate(paths): # Apply policies, values
-                    turn_value = path.pop()
-                    leaf_hash, leaf_move = path[-1]
-                    leaf_node = self.TT[leaf_hash] # hash, move
-                    policies = p[i]
-                    value = v[i].item()
-                    
-                    # Apply policies
-                    for move in leaf_node.P:
-                        leaf_node.P[move] = policies[move].item()
-                        
-                    # Apply values/ Remove virtual loss
-                    # print(VIRTUAL_LOSS+(value*turn_value))
-                    self.backpropagate(path, value, increase_visit=False, undo_move=False, demand_flip=turn_value, v_loss=-VIRTUAL_LOSS, state=root_state) # type: ignore
-            
+            self.TT[zhash] = node
+            return node
 
-    def simulate(self, root_state: State, paths: deque[deque[tuple]]):
-        batch = []
-        path: deque[tuple] = deque()
-        
-        root_hash = root_state.board.__hash__()
-        root_node = self.TT[root_hash]
-        zhash = root_hash
-        pzhash = None
-        
-        batch_size = self.get_batchsize()
-        
-        for i in range(batch_size):
-            path.clear()
-            curr_diff = root_node.matdiff
-            
-            while True: # Travelling
-                if zhash not in self.TT: # Unexpanded node
-                    # expand
-                    # with torch.no_grad():
-                    #     policy, value = self.model(state.tokens)
-                    #     masked_p: dict[tuple, float] = dict()
-                    
-                    policies = {}
-                    node = Node(policies)
-                    node.matdiff = curr_diff
-                    
-                    for lmove in sorted(root_state.board.legal_moves(), key=lambda x: mvv_lva_score(root_state.board, x), reverse=True):
-                        e = encode_move(lmove, root_state.board)
-                        policies[e] = 0
-                        node.N[e] = 0
-                        node.W[e] = 0
-                        
-                        turn_value = 2*int(root_state.board.turn == chess.WHITE) - 1
-                        
-                        if is_enpassant(root_state.board, lmove):
-                            node.matdiff[e] = 1 * turn_value
-                        if lmove.is_capture(root_state.board):
-                            captured: chess.Piece = root_state.board[lmove.destination] #type: ignore
-                            # print(root_state.board.pretty(), lmove.san(root_state.board), end='\n==================\n')
-                            node.matdiff[e] = turn_value * PIECE_VALUES[captured.piece_type]/100
-                            
-                            print(lmove.san(root_state.board))
-                            print(root_state.board.pretty())
+    def _ensure_root_expanded(self, state: State, root_hash: int):
+        with self._tt_lock:
+            if root_hash not in self.TT:
+                self._expand(state, root_hash)
 
-                    self.TT[zhash] = node
-                    
-                    # Append to the batch for GPU
-                    batch.append(root_state.tokens)
-                    
-                    # adding an int that represent current turn for back-prop when the batch is full (-1 for black, 1 for white)
-                    turn_value = int(not root_state.board.turn==chess.WHITE)*2-1
-                    
-                    self.backpropagate(path, value=0, v_loss=VIRTUAL_LOSS, state=root_state) # Apply virtual loss
-                    
-                    path.append(turn_value) #type: ignore // do this after back prop to not break it
-                    
-                    if zhash != root_hash: # No path needed if we're expanding root node
-                        paths.append(path.copy())
-                    
-                    zhash = root_hash # travel from the root again
-                    pzhash = None
-                    break
-                
-                # Travelling down
-                node = self.TT[zhash]
-
-                move = self.select_move(node, root_state.board)
-
-                path.append((zhash, move))
-                root_state.make_move(move)
-                
-                curr_diff = self.TT[zhash].matdiff
-
-                # If the node is a terminal 
-                terminal_state = is_terminal(root_state.board)
-                if terminal_state is not None:
-                    # print(terminal_state)
-                    # print(root_state.board.pretty())
-                    # debug_path(path, root_state.board.copy())
-                    self.backpropagate(path, value = terminal_state, state=root_state)
-                    self.TT[zhash].is_terminal[move] = True
-                    zhash = root_hash 
-                    pzhash = None
-                    break
-                pzhash = zhash
-                zhash = root_state.board.__hash__() # Travel down
-                
-        
-        # print(*paths, sep='\n')
-        if batch:
-            batch = torch.concat(batch)
-        return batch
-
-    def select_move(self, node: Node, board: chess.Board)-> tuple:
-        total_N = sum(node.N.values())
+    # ── Move selection (UCB + material heuristic) ──────────────────
+    def _select_move(self, node: Node, board: chess.Board) -> tuple:
+        c_puct   = self.get_cpuct()
+        total_N  = sum(node.N.values())
+        sqrt_N   = math.sqrt(total_N + 1)
+        is_black = board.turn == chess.BLACK
 
         best_score = -1e9
-        best_move = None
-        
-        c_puct = self.get_cpuct()
-        
+        best_move  = None
 
         for move in node.P:
-            Q = node.Q.get(move, 0)
-            U = c_puct * node.P.get(move, 0) * math.sqrt(total_N + 1) / (1 + node.N.get(move, 0)) #type: ignore
-            
-            diff = node.matdiff.get(move, 0)*0.01
-            if board.turn == chess.BLACK:
+            Q    = node.Q.get(move, 0.0)
+            U    = c_puct * node.P.get(move, 0.0) * sqrt_N / (1 + node.N.get(move, 0))
+            diff = node.matdiff.get(move, 0.0) * 0.01
+            if is_black:
                 diff = -diff
-            
-            score = Q + U + diff #type: ignore
-
+            score = Q + U + diff
             if score > best_score:
                 best_score = score
-                best_move = move
-        return best_move # type: ignore
+                best_move  = move
 
+        return best_move  # type: ignore
 
-    def backpropagate(self, path: deque[tuple], value, state: State, increase_visit = True, undo_move = True, v_loss = 0, demand_flip = None):
-        board = state.board
-        
-        # Revert based on demand or on turn
-        if not demand_flip:
+    # Public alias for external callers
+    def select_move(self, node: Node, board: chess.Board) -> tuple:
+        return self._select_move(node, board)
+
+    # ── Backpropagation  (caller MUST hold _tt_lock) ───────────────
+    def _backpropagate_locked(
+        self,
+        path,
+        value: float,
+        board: chess.Board,
+        increase_visit: bool = True,
+        v_loss: int          = 0,
+        demand_flip          = None,
+    ):
+        """
+        Walk path in reverse and update N / W / Q.
+
+        demand_flip: ±1 captured at the leaf's turn; used when the board position
+                     no longer reflects the path (batched backprop).
+                     Pass None to infer flip from board.turn.
+        v_loss:      +VIRTUAL_LOSS to penalise, -VIRTUAL_LOSS to undo.
+        """
+        if demand_flip is None:
+            # Value is from the perspective of the side that just moved; negate
+            # so it becomes from the perspective of the node's parent.
             if board.turn == chess.WHITE:
                 value = -value
         else:
             value *= demand_flip
 
-        
         iv = int(increase_visit)
-        
-        for hash, move in reversed(path):
-            node = self.TT[hash]
-            node: Node
-            move: tuple
-            
-            node.N[move] = node.N.get(move, 0) + v_loss + iv
-            node.W[move] = node.W.get(move, 0) + value - v_loss
-            node.Q[move] = node.W[move] / node.N[move]
-            
+
+        for hash_, move in reversed(path):
+            node = self.TT.get(hash_)
+            if node is None:
+                value = -value
+                continue
+
+            node.N[move]      = node.N.get(move, 0) + v_loss + iv
+            node.W[move]      = node.W.get(move, 0.0) + value - v_loss
+            n                 = node.N[move]
+            node.Q[move]      = node.W[move] / n if n else 0.0
             node.total_visit += v_loss + iv
-            
-            value = -value  # switch player
-            
-            if undo_move and isinstance(board, chess.Board):
-                state.unmake_move()
 
-    # =========================
-    # POLICY + SAMPLING
-    # =========================
-    def get_policy(self, zhash):
-        node = self.TT[zhash]
+            value = -value
 
+    # Public alias for external callers (acquires lock)
+    def backpropagate(self, path, value, state: State,
+                      increase_visit=True, v_loss=0, demand_flip=None):
+        with self._tt_lock:
+            self._backpropagate_locked(
+                path, value, state.board,
+                increase_visit=increase_visit,
+                v_loss=v_loss,
+                demand_flip=demand_flip,
+            )
+
+    # ── Policy + sampling ──────────────────────────────────────────
+    def get_policy(self, zhash: int) -> dict:
+        node   = self.TT[zhash]
+        moves  = list(node.N.keys())
         visits = np.array(list(node.N.values()), dtype=np.float32)
-        moves = list(node.N.keys())
-        
-        if self.step <= self.latethresh:
-            temperature = 1
-        else:
-            temperature = 0
 
-        if temperature == 0:
-            best = np.argmax(visits)
-            pi = np.zeros_like(visits)
-            pi[best] = 1.0
+        if self.step <= self.latethresh:
+            total = visits.sum()
+            pi    = visits / total if total > 0 else np.ones_like(visits) / max(len(visits), 1)
         else:
-            visits = visits ** (1 / temperature)
-            pi = visits / visits.sum()
-        
+            pi        = np.zeros_like(visits)
+            pi[int(np.argmax(visits))] = 1.0
+
         return dict(zip(moves, pi))
 
-    def sample_move(self, pi: dict[tuple, float]) -> tuple:
+    def sample_move(self, pi: dict) -> tuple:
         moves = list(pi.keys())
         probs = list(pi.values())
         return random.choices(moves, weights=probs, k=1)[0]
 
-    # =========================
-    # 🎓 TRAINING TARGETS
-    # =========================
+    # ── Training targets ───────────────────────────────────────────
     def assign_values(self, game_data, outcome, buffer: deque | None = None):
-        if buffer is not None:
-            results = buffer
-        else:
-            results = deque()
-
+        results = buffer if buffer is not None else deque()
         for state_enc, pi in game_data:
             results.append((state_enc, pi, outcome))
-
         return results
